@@ -490,10 +490,16 @@ export const releaseDocument = () => call('releaseDocument', {}, null, 30_000, '
 /** Engine residency snapshot (verify/debug): { cachedImages, lane, … }. */
 export const engineState = () => call('state', {}, null, 30_000, 'engine state')
 
-/** Free reloadable residents under memory pressure. */
+/** Free reloadable residents under memory pressure. Level ≥ 1 also terminates
+ *  the detect worker — the detectors moved out of the engine (detect-worker.js),
+ *  so the engine op alone can no longer honor the ladder's "detector first"
+ *  contract; after this call the detector is guaranteed non-resident either way,
+ *  which is what the reported 'detector' entry means. */
 export const relievePressure = async (level = 1) => {
+    if (level >= 1) disposeDetectWorker()
     const res = await call('pressure', { level }, null, INFER_TIMEOUT_MS, 'relieve pressure')
-    return res?.freed || []
+    const freed = res?.freed || []
+    return level >= 1 ? ['detector', ...freed] : freed
 }
 
 /** Deliberate worker recycle (hibernate / pressure ≥ 3 on the wasm lane) —

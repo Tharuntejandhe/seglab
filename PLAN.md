@@ -66,10 +66,19 @@ SlimSAM's processor resizes every input to 1024.)
 | peak measured bytes | 367 MB | ~1.9–2.6 GB transient (encode+detect) |
 | resident after release | 206 MB | **20 MB** (`freed=[embedding,arena,worker]`) |
 
-Verify: 114 ok; the 4 failing gates (std8/pro/working-copy export dims,
-pressure-ladder `detector` in freed) fail IDENTICALLY on a clean HEAD
-baseline — pre-existing debt from the YOLOE merge (stale gate expectations
-and/or an export regression), tracked separately, not introduced here.
+Verify: now **118 ok / exit 0** (was 114 ok + 4 pre-existing failures from the
+YOLOE merge, confirmed identical on a clean HEAD baseline). Triage outcome:
+ONE real app regression — the merge moved detectors into the disposable
+detect-worker but nothing terminated it under memory pressure anymore; fixed
+in sam-client.relievePressure (level ≥ 1 disposes the detect worker first and
+reports 'detector' — guaranteed non-resident after the call). The THREE export
+gates asserted the retired full-frame-PNG contract; export-hd's deliverable is
+deliberately the PADDED CROP RECT at native res (bbox + max(24, 6%·diag) —
+verified against observations: disc@2400→655, disc@4200→1147, dot@5000→148).
+Gates rewritten to that contract with real teeth: std8-vs-lite now runs a
+5600 px scene where cropMaxSide genuinely bites (lite 1280-capped composite vs
+std8 1530 HD-decoded — measured exactly that), and pro/working-copy assert the
+native-res rect ±slack plus the existing decode/alpha/radial checks.
 Tools: `scripts/quantize-detect-lanes.py` (CALIB_DIR of photos → int8),
 `scripts/profile-chrome.mjs [gpu|wasm]` (real-Chrome memory/latency drive,
 fixture `models/test-fixtures/dslr-45mp.jpg`).

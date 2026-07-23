@@ -1169,34 +1169,40 @@ try {
   )
   await pageC.close()
 
-  /* ── Export caps by tier: lite bounds to ≤8 MP from the proxy (no re-decode);
-       standard8 unlocks a bigger, HD-decoded cutout (the quality win). ── */
-  const pageX = await newAppPage(context, '?flagship=0', 4200, { pin: 'lite' })
+  /* ── Export caps by tier. The deliverable is a TIGHT cutout at the crop's
+       resolution (export-hd: padded crop rect, never a full-frame canvas), so
+       the tier cap that bites is cropMaxSide (lite 1280 / std8 1536). At
+       5600 px the disc's padded rect (≈1530 px) exceeds lite's cap but fits
+       std8's: lite exports 1280-bounded without a re-decode; standard8 exports
+       the same object larger AND HD-decoded — the tier's quality unlock. ── */
+  const pageX = await newAppPage(context, '?flagship=0', 5600, { pin: 'lite' })
   const geoX = await pageX.evaluate(() => window.__seglab.demoGeometry())
   await pageX.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoX.disc.x * geoX.proxyScale, y: geoX.disc.y * geoX.proxyScale })
   const exLite = await pageX.evaluate(() => window.__seglab.exportCutout())
   check(
-    'lite export: bounded to ≤4096 px / ≤8 MP, no crop re-decode, coverage sane',
-    exLite && exLite.w <= 4096 && exLite.h <= 4096 && (exLite.w * exLite.h) <= 8.05e6
-      && exLite.w < geoX.originalW && exLite.decoded === false && exLite.coverage > 0.01,
-    `export ${exLite?.w}×${exLite?.h} (${((exLite?.w * exLite?.h || 0) / 1e6).toFixed(1)} MP), decoded=${exLite?.decoded}`,
+    'lite export: tight cutout bounded by cropMaxSide (≤1280), no crop re-decode',
+    exLite && exLite.w <= 1284 && exLite.h <= 1284
+      && exLite.w < geoX.disc.r * 2 // the cap genuinely bit (native bbox is larger)
+      && exLite.decoded === false && exLite.coverage > 0.01,
+    `export ${exLite?.w}×${exLite?.h} (native bbox ≈${Math.round(geoX.disc.r * 2)}px), decoded=${exLite?.decoded}`,
   )
   await pageX.close()
 
-  // standard8 (pinned) exports the SAME 4200 px source larger and HD-decoded —
-  // the adaptive quality unlock a capable device now reaches automatically.
-  const pageX8 = await newAppPage(context, '?flagship=0', 4200, { pin: 'standard8' })
+  // standard8 (pinned) exports the SAME 5600 px source strictly larger
+  // (cropMaxSide 1536 vs 1280) and HD-decoded — the adaptive quality unlock a
+  // capable device now reaches automatically. Same tight-cutout shape.
+  const pageX8 = await newAppPage(context, '?flagship=0', 5600, { pin: 'standard8' })
   const budX8 = await pageX8.evaluate(() => window.__seglab.resourceBudget())
   const geoX8 = await pageX8.evaluate(() => window.__seglab.demoGeometry())
   await pageX8.evaluate(({ x, y }) => window.__seglab.clickAt(x, y), { x: geoX8.disc.x * geoX8.proxyScale, y: geoX8.disc.y * geoX8.proxyScale })
   const exStd8 = await pageX8.evaluate(() => window.__seglab.exportCutout())
   check(
-    'standard8 export: unlocks a larger, HD-decoded cutout (≤5120 px / ≤12 MP) than lite',
+    'standard8 export: unlocks a larger (≤1536), HD-decoded cutout over lite',
     budX8.profile === 'standard8' && budX8.exportMaxMP === 12
-      && exStd8 && exStd8.w <= 5120 && (exStd8.w * exStd8.h) <= 12.1e6
-      && (exStd8.w * exStd8.h) > (exLite.w * exLite.h) // genuinely larger than the lite bound
+      && exStd8 && exStd8.w <= 1560 && exStd8.h <= 1560 // padded rect ≈1530 + bbox slop
+      && (exStd8.w * exStd8.h) > (exLite.w * exLite.h) // genuinely larger than lite's bound
       && exStd8.decoded === true && exStd8.coverage > 0.01,
-    `std8 export ${exStd8?.w}×${exStd8?.h} (${((exStd8?.w * exStd8?.h || 0) / 1e6).toFixed(1)} MP, decoded=${exStd8?.decoded}) vs lite ${((exLite.w * exLite.h) / 1e6).toFixed(1)} MP`,
+    `std8 export ${exStd8?.w}×${exStd8?.h} (decoded=${exStd8?.decoded}) vs lite ${exLite.w}×${exLite.h}`,
   )
   await pageX8.close()
 
@@ -1336,11 +1342,15 @@ try {
     (probe) => window.__seglab.exportCutout(probe),
     { cx: geoD.disc.x, cy: geoD.disc.y, r: geoD.disc.r },
   )
+  // Tight-cutout contract: the deliverable is the disc's padded crop rect at
+  // NATIVE resolution (2r + 2·max(24, 6%·diag)), not a full-frame canvas.
+  const discRect = (r) => 2 * r + 2 * Math.max(24, 0.06 * 2 * r * Math.SQRT2)
   check(
-    'HD export (pro): native dimensions, crop re-decoded, alpha correct',
-    ex && ex.w === geoD.originalW && ex.h === geoD.originalH && ex.decoded === true
-      && ex.centerOpaque && ex.outsideTransparent,
-    `export ${ex?.w}×${ex?.h} decoded=${ex?.decoded}`,
+    'HD export (pro): native-res tight cutout, crop re-decoded, alpha correct',
+    ex && ex.w >= geoD.disc.r * 2 * 0.95 && ex.w <= discRect(geoD.disc.r) + 16
+      && ex.h >= geoD.disc.r * 2 * 0.95 && ex.h <= discRect(geoD.disc.r) + 16
+      && ex.decoded === true && ex.centerOpaque && ex.outsideTransparent,
+    `export ${ex?.w}×${ex?.h} (2r=${Math.round(geoD.disc.r * 2)}, rect≈${Math.round(discRect(geoD.disc.r))}) decoded=${ex?.decoded}`,
   )
   check(
     'HD export (pro): boundary within 3px of the analytic disc',
@@ -1391,10 +1401,14 @@ try {
     `fired=${escWk.fired} decoded=${escWk.decoded} radialErr=${escWk.radialErr?.toFixed(1)}px`,
   )
   const exWk = await pageWk.evaluate((probe) => window.__seglab.exportCutout(probe), { cx: geoWk.dot.x, cy: geoWk.dot.y, r: geoWk.dot.r })
+  // Native-res tight cutout of the dot (2r + 2·pad, pad floor 24) — decoded
+  // fresh (bypassing the ≤4096 working copy) with the boundary at native scale.
+  const dotRect = 2 * geoWk.dot.r + 2 * Math.max(24, 0.06 * 2 * geoWk.dot.r * Math.SQRT2)
   check(
-    'working copy: export bypasses it — native dimensions, fresh decode',
-    exWk && exWk.w === geoWk.originalW && exWk.decoded === true && exWk.radialErr <= 3,
-    `export ${exWk?.w}×${exWk?.h}, decoded=${exWk?.decoded}, radialErr=${exWk?.radialErr?.toFixed(1)}px`,
+    'working copy: export bypasses it — native-res tight cutout, fresh decode',
+    exWk && exWk.w >= geoWk.dot.r * 2 * 0.95 && exWk.w <= dotRect + 16
+      && exWk.decoded === true && exWk.radialErr <= 3,
+    `export ${exWk?.w}×${exWk?.h} (2r=${Math.round(geoWk.dot.r * 2)}, rect≈${Math.round(dotRect)}), decoded=${exWk?.decoded}, radialErr=${exWk?.radialErr?.toFixed(1)}px`,
   )
   await pageWk.close()
 
