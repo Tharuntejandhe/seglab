@@ -15,7 +15,7 @@ import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, 
 import {
     cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure, recycleWorker,
 } from './sam-client.js'
-import { applyMemoryPressure, resolveBudget } from './policy.js'
+import { applyMemoryPressure, climbBudget, resolveBudget } from './policy.js'
 import { createMemoryGovernor } from './memory-governor.js'
 import { probeCapability, readPhosmithResources, withPhosmithResources } from './capability.js'
 import { importOriginal, hasOriginal, getTransform, releaseAsset, getOriginalBlob, getAssetKey } from './asset-store.js'
@@ -52,17 +52,41 @@ const readYoloeScale = () => {
 let yoloeScaleOverride = readYoloeScale()
 
 // Session budget: profile preset + URL overrides. The provisional budget is
-// LITE — nothing above it can be proven before the capability probe, and a
-// plain browser stays lite forever unless a trusted Phosmith hint or the
-// user's own profile toggle raises it.
+// LITE — nothing above it can be proven before the capability probe. Above the
+// auto-tier, only a trusted Phosmith hint, the user's own profile toggle, or
+// the governor's measured-headroom climb (one step, standard8 → standard) can
+// raise it.
 let BUDGET = resolveBudget(location.search, null, profileOverride, yoloeScaleOverride)
 let capability = null
 let pendingPhosmithResources = null
+
+// Measured-headroom climb state — page-lifetime only, never persisted: every
+// session must re-prove its headroom. `lastHeadroomAt` is the freshness stamp
+// the export/escalation predicates read; a shed or a new import zeroes it.
+let climbLatched = false
+let climbPoisoned = false
+let lastHeadroomAt = 0
+
+// Every budget re-resolution funnels through here so a latched climb is
+// re-applied (or correctly dropped: climbBudget re-checks eligibility, so a
+// manual override or a Phosmith trust flip wins over the climb).
+const recomputeBudget = () => {
+    let next = applyMemoryPressure(
+        resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride),
+        BUDGET.pressureLevel || 0,
+    )
+    if (climbLatched && !climbPoisoned) {
+        const climbed = climbBudget(location.search, capability, yoloeScaleOverride, next)
+        if (climbed) next = applyMemoryPressure(climbed, BUDGET.pressureLevel || 0)
+        else climbLatched = false
+    }
+    BUDGET = next
+}
 const bootProbe = probeCapability().then((cap) => {
     capability = pendingPhosmithResources
         ? withPhosmithResources(cap, pendingPhosmithResources)
         : cap
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
+    recomputeBudget()
     refreshChips()
     return cap
 }).catch((err) => {
@@ -216,8 +240,11 @@ const refreshChips = () => {
         els.profileSelect.value = profileOverride || 'auto'
         const autoOpt = els.profileSelect.querySelector('option[value="auto"]')
         // Auto now APPLIES the capability auto-tier (from GPU + core signals),
-        // not just a suggestion — show the tier it resolved to.
-        const autoName = BUDGET.memoryLocked ? (capability?.autoTier || 'lite') : profile
+        // not just a suggestion — show the tier it resolved to. A measured-
+        // headroom climb labels itself so 'standard' is visibly earned, not set.
+        const autoName = BUDGET.profileSource === 'auto-climb'
+            ? 'standard — measured'
+            : (BUDGET.memoryLocked ? (capability?.autoTier || 'lite') : profile)
         if (autoOpt) autoOpt.textContent = `Profile: Auto (${autoName})`
         // Warn when a manual override goes ABOVE the safe auto ceiling — the
         // user is vouching for this device, past what the signals prove safe.
@@ -246,7 +273,8 @@ const applyPhosmithResources = (resources = readPhosmithResources()) => {
     const previous = capability
     capability = withPhosmithResources(capability, resources)
     // Pressure is a one-way ratchet: a live budget update never resets it.
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
+    // recomputeBudget re-checks a latched climb — a trust flip drops it.
+    recomputeBudget()
     const memoryReduced = previous.memoryGB > 0 && capability.memoryGB > 0
         && capability.memoryGB < previous.memoryGB
     const needsHeavyRelease = memoryReduced
@@ -278,7 +306,9 @@ const setProfileOverride = (value) => {
         else localStorage.removeItem(PROFILE_OVERRIDE_KEY)
     } catch { /* private browsing / storage disabled — override stays in-memory only */ }
     const previousProfile = BUDGET.profile
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
+    // A manual choice beats a latched climb: after the override resolves,
+    // profileSource is 'manual', climbBudget refuses, and the latch clears.
+    recomputeBudget()
     const needsHeavyRelease = (PROFILE_RANK[BUDGET.profile] || 0) < (PROFILE_RANK[previousProfile] || 0)
     if (needsHeavyRelease) relievePressure(3).catch(() => {})
     refreshChips()
@@ -300,7 +330,7 @@ const setYoloeScale = (value) => {
         if (yoloeScaleOverride) localStorage.setItem(YOLOE_SCALE_KEY, yoloeScaleOverride)
         else localStorage.removeItem(YOLOE_SCALE_KEY)
     } catch { /* storage disabled — in-memory only */ }
-    BUDGET = applyMemoryPressure(resolveBudget(location.search, capability, profileOverride, yoloeScaleOverride), BUDGET.pressureLevel || 0)
+    recomputeBudget()
     refreshChips()
 }
 els.yoloeSelect?.addEventListener('change', (e) => {
@@ -487,6 +517,10 @@ const showImage = async (source, {
     // decode against any still-running kernel.
     clearHeavyQueue()
     if (warmStarted) releaseDocument()
+    // Headroom measured against the outgoing document must not vouch for this
+    // one (a fresh NEF changes the memory picture); the climb latch stays —
+    // only its freshness-gated extras (warm-export, escalation) re-earn.
+    lastHeadroomAt = 0
 
     // A RAW container's embedded JPEG preview (not the 33 MB sensor payload)
     // becomes the only image decoded during interaction.
@@ -694,6 +728,16 @@ window.addEventListener('paste', (e) => {
 
 const shedMemory = (level, { announce = true } = {}) => {
     const previous = BUDGET.pressureLevel || 0
+    // Real pressure permanently cancels headroom climbing this session, and
+    // "down always wins" includes the climbed tier itself: demote the base back
+    // to the auto tier FIRST so the ratchet floors apply to standard8's caps,
+    // not the climbed standard's higher ones.
+    climbPoisoned = true
+    lastHeadroomAt = 0
+    if (climbLatched) {
+        climbLatched = false
+        recomputeBudget()
+    }
     BUDGET = applyMemoryPressure(BUDGET, level)
     if ((BUDGET.pressureLevel || 0) >= 2) disposeCvRefine() // idle wasm worker goes first
     if (announce && BUDGET.pressureLevel > previous) {
@@ -719,28 +763,40 @@ const shedMemory = (level, { announce = true } = {}) => {
     })
 }
 
-// Backgrounded tab → drop the detector (cheap to reload) and stop optional
-// detail escalation. The full image remains a compressed Blob, not RGBA RAM.
+// Backgrounded tab → drop the detector (cheap to reload). Deliberately NOT
+// shedMemory: the pressure ratchet is one-way, so ratcheting here would let a
+// single tab switch permanently disable eager-encode, the GPU detector lane
+// and the headroom climb for the whole session. Housekeeping, not pressure.
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden && state.hasImage) shedMemory(1, { announce: false })
+    if (document.hidden && state.hasImage) relievePressure(1).catch(() => {})
 })
 
 // Runtime memory governor — the real safety net (memory-governor.js). It reads
 // measured agent-cluster bytes (measureUserAgentSpecificMemory, sees WASM),
 // timer drift (device swap signal) and JS heap; the old JS-heap-only watchdog
-// was blind to the WASM/GPU memory that actually OOMs the app. onHeadroom is the
-// tier-climb signal (wired to the adaptive tier in a later step); for now it is
-// telemetry only.
+// was blind to the WASM/GPU memory that actually OOMs the app. onHeadroom is
+// the tier-climb signal: PROVEN sustained headroom (real bytes well under
+// budget, no drift, 4 clean cycles) raises a live standard8 auto-tier one step
+// to 'standard' (policy.climbBudget) — the only path an unverified browser has
+// above standard8. Any pressure event poisons climbing for the session.
 const DEBUG = /[?&]debug=1\b/.test(location.search)
 const governor = createMemoryGovernor({
     getBudget: () => BUDGET,
     isActive: () => state.hasImage && !document.hidden,
     onPressure: (level) => shedMemory(level, { announce: level >= 2 }),
     onHeadroom: () => {
-        // Placeholder until adaptive tiering consumes it. Proven headroom means
-        // the device is comfortably under its tier budget with no swap.
-        if (DEBUG) console.log('[seglab][governor] headroom proven — climb candidate')
+        // Freshness stamp first — the export/escalation predicates treat recent
+        // proven headroom as the license to keep/spend more transient memory.
+        lastHeadroomAt = Date.now()
         window.__seglabHeadroom = (window.__seglabHeadroom || 0) + 1
+        if (climbLatched || climbPoisoned) return
+        const next = climbBudget(location.search, capability, yoloeScaleOverride, BUDGET)
+        if (!next) return
+        BUDGET = next
+        climbLatched = true
+        refreshChips()
+        if (DEBUG) console.log('[seglab][governor] headroom proven — climbed to standard')
+        setStatus('Headroom verified — export quality raised to standard (applies to the next export/import)')
     },
     onSample: DEBUG ? (s) => console.log('[seglab][governor]', s) : undefined,
 })
@@ -1607,6 +1663,10 @@ const shouldEscalate = (summary) => {
 async function maybeEscalate(revision) {
     // The tiny-bbox test must see the live object, not the composed union.
     if (!state.liveMask || !shouldEscalate(state.liveSummary)) return
+    // On a climbed budget, escalation's native re-decode transient (~2 GB on a
+    // NEF) additionally requires FRESH measured headroom — the climb proved
+    // residency was low, not that this peak fits. Manual/trusted tiers vouch.
+    if (BUDGET.profileSource === 'auto-climb' && Date.now() - lastHeadroomAt >= 30_000) return
     // One escalation per SETTLED selection: skip while more input is pending,
     // and let a click-burst supersede us before the heavy crop pipeline starts.
     if (state.runQueued || debounceArmed) return
@@ -2200,12 +2260,17 @@ els.cutout.addEventListener('click', async () => {
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
         // Detector and wasm-refine workers are unrelated to a cutout export and
-        // hold memory. On a memory-tight context (the WASM floor, or already
-        // under pressure) free both before the export canvases. On a healthy GPU
-        // device with no pressure, keep the detector warm — its footprint is
-        // small there and export is cheap, so a search→export→search stays
-        // instant instead of paying a session rebuild. cv-refine goes either way.
+        // hold memory. Keeping the detector warm through the heaviest pixel op
+        // requires POSITIVE proof of headroom, not just absence of pressure —
+        // pressure is a lagging signal (the export itself is the trigger), and
+        // memory-locked iGPU devices run device==='webgpu' too. So: warm only
+        // when not on the WASM floor, not under pressure, AND (for unverified
+        // budgets) the governor measured real headroom within the last 30 s.
+        // Trusted hosts vouched real memory and often lack the measure API
+        // (Safari/WebView), so absence-of-pressure suffices there. Devices that
+        // can't measure never prove headroom → always shed → safe default.
         const tight = clientState.device === 'wasm' || (BUDGET.pressureLevel || 0) > 0
+            || (BUDGET.memoryLocked && Date.now() - lastHeadroomAt >= 30_000)
         if (tight) await relievePressure(1)
         disposeCvRefine()
         let out = null
@@ -2291,6 +2356,9 @@ window.__seglab = {
     // Boot capability probe result { webgpu, fallback, f16, deviceMemoryGB,
     // profile } — awaits the probe so it is never null.
     capability: async () => { await bootProbe; return capability },
+    // Memory governor instance (cycleNow / feedMeasurement) — the live climb
+    // gate drives headroom cycles through this instead of waiting minutes.
+    governor,
     // Current resolved budget (including a dynamic Phosmith resource hint).
     resourceBudget: async () => { await bootProbe; return { ...BUDGET } },
     // Native host test/integration hook. Production hosts normally inject the

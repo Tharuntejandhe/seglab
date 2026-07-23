@@ -150,6 +150,16 @@ try {
     report.checks.cutout = { file: path }
     await snap('final')
 
+    // Measured-headroom climb: let the governor run real cycles (~15 s covers
+    // 4+ decision cycles with real measureUserAgentSpecificMemory samples). On
+    // a healthy GPU device this should raise standard8 → standard.
+    await page.waitForTimeout(15000)
+    report.checks.climb = await page.evaluate(async () => {
+        const b = await window.__seglab.resourceBudget()
+        return { profile: b.profile, source: b.profileSource, exportFullRes: b.exportFullRes, headroomFires: window.__seglabHeadroom || 0 }
+    })
+    await snap('after-climb-window')
+
     // Pressure-3 release: on the wasm lane the SAM worker must be recycled,
     // returning its grown wasm Memory to the OS — resident should collapse.
     report.checks.released = await page.evaluate(() => window.__seglab.releaseMemory())
@@ -164,7 +174,7 @@ try {
         withinBudget: (report.milestones.final?.uasMax ?? 0) <= verdictBudget,
     }
     writeFileSync(`${OUT}-report.json`, JSON.stringify(report, null, 2))
-    console.log(JSON.stringify({ scenario: SCENARIO, budget: report.budget, timings: report.timings, verdict: report.verdict, residentAfterRelease: report.milestones['after-release'], released: report.checks.released, checks: { eager: report.checks.eagerEncode, yoloeCold: report.checks.yoloeCold, yoloWorld: report.checks.yoloWorld, click1cov: report.checks.click1?.mask?.coverage, click2cov: report.checks.click2?.mask?.coverage } }, null, 1))
+    console.log(JSON.stringify({ scenario: SCENARIO, budget: report.budget, timings: report.timings, verdict: report.verdict, climb: report.checks.climb, residentAfterRelease: report.milestones['after-release'], released: report.checks.released, checks: { eager: report.checks.eagerEncode, yoloeCold: report.checks.yoloeCold, yoloWorld: report.checks.yoloWorld, click1cov: report.checks.click1?.mask?.coverage, click2cov: report.checks.click2?.mask?.coverage } }, null, 1))
     await browser.close()
 } finally {
     server.kill()

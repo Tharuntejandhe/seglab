@@ -1,5 +1,44 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
+## 2026-07-23 — measured-headroom climb: high-end devices auto-reach `standard` (SHIPPED)
+
+The auto-tier ceiling was standard8 for every plain browser — a 64 GB gaming
+tower reads `deviceMemory: 8` (privacy cap), so boot signals can never prove
+more. The governor's `onHeadroom` (4 clean 2.5 s cycles, measured bytes
+< 0.5×budget, drift < 500 ms) was telemetry-only; it now drives
+`policy.climbBudget`: a live standard8 **auto** tier climbs ONE step to
+`standard` (`profileSource: 'auto-climb'`), unlocking native-res export, auto
+escalation and 24 MP caps. Fields headroom can't vouch for are masked to the
+standard8 stance: `samIdleMs` 300 s, `embedPersist` false, `draftCacheMax` 1,
+`memBudgetMB` 1900 (the climb never raises the governor ceiling that
+authorized it), `flagship` false. Escalation on a climbed budget additionally
+requires headroom measured in the last 30 s. Any pressure event demotes the
+climbed tier back to standard8 BEFORE the ratchet applies (down always wins)
+and poisons re-climbing for the session; the climb state is page-lifetime and
+re-earned every session. All budget re-resolutions (probe, Phosmith update,
+profile/scale toggles) funnel through one `recomputeBudget()` that re-applies
+or correctly drops a latched climb (manual override and trust flips win).
+
+Also in this change, from the same review:
+- **Export predicate** (the ultrareview finding): keeping the detect worker
+  warm across export now needs POSITIVE proof — not-wasm AND pressure 0 AND
+  (on memory-locked budgets) headroom measured within 30 s. Trusted hosts
+  (vouched memory, often no measure API) keep absence-of-pressure semantics.
+  A new import zeroes the freshness stamp.
+- **Visibility shed no longer ratchets**: backgrounding a tab called
+  `shedMemory(1)` whose pressure ratchet is one-way — a single tab switch
+  permanently disabled eager-encode + the GPU detector lane. It now disposes
+  reloadables (`relievePressure(1)`) without touching the budget.
+- **Detector scale fallback**: yoloe/yolo-world lanes retry at scale 's' when
+  a larger scale's files aren't deployed (the footer switcher can't strand
+  search on a partial deploy; vocab follows the actually-loaded scale).
+
+Gates: pure climb matrix (eligibility × masks × URL-lowering survival) + live
+climb/demote/poison gate driven through `__seglabGovernor.feedMeasurement` +
+`cycleNow` with a stubbed non-fallback adapter (headless SwiftShader is a
+fallback → real path ineligible in CI) + manual-override negative + visibility
+no-ratchet gate. Full suite green.
+
 ## 2026-07-23 — GPU-first detect lanes, int8 wasm floor, 8 GB import/search hardening (SHIPPED)
 
 Models are now fully materialized locally (previously the YOLO/CLIP lanes 404'd

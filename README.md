@@ -64,7 +64,15 @@ mobile, not a genuine sub-8 GB reading. A device that clears all of those runs
 **standard8**: memory-close to lite (same one embedding, one heavy job, ~1.3 GB
 NEF import peak) but with a crisper preview and a bigger, HD-decoded **12 MP**
 export. Everything else — a phone, a GPU-less device, a low-core or low-memory
-one — stays on lite. Nothing auto-climbs past standard8.
+one — stays on lite. Above standard8 there is exactly one automatic step: when
+the governor **measures** sustained real headroom (agent-cluster bytes well
+under budget, no timer drift, four clean cycles), the session climbs to
+**standard** — native-res export, auto small-object escalation, 24 MP caps —
+with the memory-sensitive fields held at the standard8 stance (hibernate stays,
+no OPFS persistence, one embedding, same governor ceiling). Any pressure event
+demotes the climb and poisons re-climbing for the session. Pro/ultra remain
+trusted-host or manual-only, and a gaming PC that wants them immediately can
+still use the profile toggle.
 
 A **runtime memory governor** (`memory-governor.js`) then guards it live: it
 watches measured agent-cluster bytes (`measureUserAgentSpecificMemory`, which

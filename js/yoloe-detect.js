@@ -91,11 +91,21 @@ export const loadYoloe = (scale = 's', { webgpu = true } = {}) => {
     loadedEps = epsKey
     sessionPromise = (async () => {
         const ort = await loadOrt()
-        await loadVocab(scale)
-        session = await buildSession(ort, scale, eps)
+        try {
+            await loadVocab(scale)
+            session = await buildSession(ort, scale, eps)
+        } catch (err) {
+            // The requested scale's files may simply not be deployed ('s' is the
+            // baseline every deploy vendors) — fall back rather than fail search.
+            if (scale === 's') throw err
+            console.warn(`[seglab] yoloe-26${scale} unavailable (${err?.message}); falling back to scale s`)
+            loadedScale = 's'
+            await loadVocab('s')
+            session = await buildSession(ort, 's', eps)
+        }
         return session
     })()
-    sessionPromise.catch(() => { if (loadedScale === scale) { sessionPromise = null; loadedScale = null; loadedEps = null } })
+    sessionPromise.catch(() => { if (loadedEps === epsKey) { sessionPromise = null; loadedScale = null; loadedEps = null } })
     return sessionPromise
 }
 
@@ -131,7 +141,7 @@ export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', webgpu
     cancelIdle()
     const ort = await loadOrt()
     const s = await loadYoloe(scale, { webgpu })
-    const vocab = await loadVocab(scale)
+    const vocab = await loadVocab(loadedScale || scale) // fallback may have loaded 's'
     const side = YOLOE_INPUT
     try {
         // RGB bytes → NCHW float32 [0,1]. frame is exactly side², 3-channel.

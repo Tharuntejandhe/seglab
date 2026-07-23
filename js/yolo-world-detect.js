@@ -96,10 +96,18 @@ export const loadYoloWorld = (scale = 's', { webgpu = true } = {}) => {
     loadedEps = epsKey
     sessionPromise = (async () => {
         const ort = await loadOrt()
-        session = await buildSession(ort, scale, eps)
+        try {
+            session = await buildSession(ort, scale, eps)
+        } catch (err) {
+            // Scale files may not be deployed ('s' is the baseline) — fall back.
+            if (scale === 's') throw err
+            console.warn(`[seglab] yolo-world-${scale} unavailable (${err?.message}); falling back to scale s`)
+            loadedScale = 's'
+            session = await buildSession(ort, 's', eps)
+        }
         return session
     })()
-    sessionPromise.catch(() => { if (loadedScale === scale) { sessionPromise = null; loadedScale = null; loadedEps = null } })
+    sessionPromise.catch(() => { if (loadedEps === epsKey) { sessionPromise = null; loadedScale = null; loadedEps = null } })
     return sessionPromise
 }
 

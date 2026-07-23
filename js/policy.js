@@ -73,9 +73,11 @@ const PRESETS = {
         workingMaxSide: 1280,    // bounded re-decode copy cap (Safari-shaped hosts)
         pressureLevel: 0,
     },
-    // The one memory-safe tier an UNVERIFIED device may auto-reach (capability
-    // autoTier) and the ceiling for browser-signal auto-climb — pro/ultra stay
-    // trusted-host or manual-override only. Deliberately MEMORY-CLOSE to lite:
+    // The one memory-safe tier an UNVERIFIED device may auto-reach from boot
+    // signals (capability autoTier). Above it there is exactly one automatic
+    // step: the governor's measured-headroom climb to `standard` (climbBudget,
+    // below) — pro/ultra stay trusted-host or manual-override only.
+    // Deliberately MEMORY-CLOSE to lite:
     // its whole design is to be safe on the worst device that reaches it (an
     // 8-core / 8 GB laptop that may be heavily loaded). It takes only the CHEAP
     // quality wins — a crisper preview and a bigger, HD-decoded EXPORT (a
@@ -361,6 +363,48 @@ export const resolveBudget = (search = typeof location !== 'undefined' ? locatio
     if (yoloeChoice === 'off') budget.yoloe = false
     else if (['n', 's', 'm', 'l', 'x'].includes(yoloeChoice)) budget.detectorScale = yoloeChoice
     return budget
+}
+
+/**
+ * Measured-headroom climb: standard8 → standard, ONE step, for a memory-locked
+ * device whose auto-tier is live and whose governor has PROVEN sustained
+ * headroom (real measured bytes well under budget, no drift — see
+ * memory-governor.js onHeadroom). This is the only path an unverified browser
+ * has above standard8; pro/ultra stay trusted-host or manual.
+ *
+ * Fields the proof cannot vouch for are masked back to the standard8 stance:
+ * headroom is a point-in-time RESIDENCY reading, not proof that a bigger
+ * arena, cache, or OPFS packing peak fits —
+ *   - samIdleMs stays 300 s (an unverified device must not pin the ORT arena
+ *     indefinitely),
+ *   - embedPersist stays false / draftCacheMax stays 1 (engine-resident copies
+ *     — warmUp is memoized, so they could not be pushed anyway),
+ *   - memBudgetMB stays 1900 (the climb must never raise the governor ceiling
+ *     that authorized it).
+ * What actually lands is the export/decode-time quality delta (exportFullRes,
+ * export/crop/escalate caps, direct + working sizes, detector idle) — all
+ * read-at-call-time main-thread fields. autoEscalate lands too but the app
+ * additionally gates it on FRESH headroom for climbed budgets.
+ *
+ * Pure: eligibility from `current`, result via resolveBudget (so every URL
+ * lowering and capability clamp still applies). Latch/poison state lives in
+ * the app. Returns null when ineligible.
+ */
+export const climbBudget = (search, capability, scaleOverride, current) => {
+    if (!current || current.memoryLocked !== true) return null
+    if (current.profileSource !== 'auto') return null
+    if (current.profile !== 'standard8') return null
+    if ((current.pressureLevel || 0) !== 0) return null
+    if (current.forceWasm) return null
+    const next = resolveBudget(search, capability, 'standard', scaleOverride)
+    if (next.profile !== 'standard') return null // override lost (e.g. trust flipped)
+    next.profileSource = 'auto-climb'
+    next.samIdleMs = PRESETS.standard8.samIdleMs
+    next.embedPersist = false
+    next.draftCacheMax = 1
+    next.memBudgetMB = PRESETS.standard8.memBudgetMB
+    next.flagship = false
+    return next
 }
 
 /**

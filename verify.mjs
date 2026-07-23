@@ -31,7 +31,7 @@ import {
 } from './js/search-taxonomy.js'
 import { classifyCapability } from './js/capability.js'
 import { refineMaskEdges } from './js/edge-refine.js'
-import { applyMemoryPressure, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
+import { applyMemoryPressure, climbBudget, resolveBudget, PROFILE_PRESETS } from './js/policy.js'
 import { decidePressure } from './js/memory-governor.js'
 import { getBoundedProxySize, displayPlan, decodeBudgetMP } from './js/proxy-plan.js'
 import {
@@ -462,13 +462,50 @@ try {
       && autoTiered.exportMaxMP === 12 && autoTiered.hdExportDecode === true
       && autoTiered.autoEscalate === false && autoTiered.samWebGPU === true
       && autoTiered.memBudgetMB <= 2000
-      && PROFILE_PRESETS.standard.autoEscalate === true, // escalation available via manual override
+      // escalation comes with manual standard, or a measured-headroom climb
+      // (where the app additionally gates it on FRESH headroom).
+      && PROFILE_PRESETS.standard.autoEscalate === true,
     JSON.stringify({ cache: autoTiered.draftCacheMax, exportMP: autoTiered.exportMaxMP, hd: autoTiered.hdExportDecode, esc: autoTiered.autoEscalate }),
   )
   check(
     'policy: standard reached via the profile toggle also evicts the detector before an encode',
     manualStandard.detectorEvictOnEncode === true && manualStandard.detectorIdleMs === 120_000,
     JSON.stringify({ evict: manualStandard.detectorEvictOnEncode, idleMs: manualStandard.detectorIdleMs }),
+  )
+
+  // Measured-headroom climb (policy.climbBudget): the ONE path an unverified
+  // browser has above standard8, driven by the governor's proven-headroom
+  // signal, never by a report or a URL.
+  const climbed = climbBudget('', eightCoreBrowser, null, autoTiered)
+  check(
+    'climb: a live standard8 auto-tier climbs one step to standard, labeled auto-climb',
+    climbed && climbed.profile === 'standard' && climbed.profileSource === 'auto-climb'
+      && climbed.memoryLocked === true && climbed.exportFullRes === true
+      && climbed.exportMaxMP === 24 && climbed.cropMaxSide === 2048,
+    JSON.stringify({ profile: climbed?.profile, source: climbed?.profileSource, exportMP: climbed?.exportMaxMP }),
+  )
+  check(
+    // Headroom is a residency reading, not proof a bigger arena/cache/packing
+    // peak fits — engine-resident and governor-ceiling fields keep the
+    // standard8 stance.
+    'climb: masks hold — hibernate stays, no OPFS persist, one embedding, governor ceiling unraised, no flagship',
+    climbed && climbed.samIdleMs === PROFILE_PRESETS.standard8.samIdleMs
+      && climbed.embedPersist === false && climbed.draftCacheMax === 1
+      && climbed.memBudgetMB === PROFILE_PRESETS.standard8.memBudgetMB
+      && climbed.flagship === false,
+    JSON.stringify({ idle: climbed?.samIdleMs, persist: climbed?.embedPersist, budget: climbed?.memBudgetMB }),
+  )
+  const climbProxyLower = climbBudget('?proxy=512', eightCoreBrowser, null, resolveBudget('?proxy=512', eightCoreBrowser))
+  check(
+    'climb: refused for manual/trusted/default/pressured/forceWasm; URL lowering survives',
+    climbBudget('', eightCoreBrowser, null, manualStandard) === null           // manual override
+      && climbBudget('', phosmith16GB, null, resolveBudget('', phosmith16GB)) === null // trusted host
+      && climbBudget('', browserEightGB, null, autoNoSignal) === null          // lite default floor
+      && climbBudget('', eightCoreBrowser, null, applyMemoryPressure(autoTiered, 1)) === null // pressured
+      && climbBudget('?force=wasm', eightCoreBrowser, null, resolveBudget('?force=wasm', eightCoreBrowser)) === null // wasm floor
+      && climbed && climbBudget('', eightCoreBrowser, null, climbed) === null  // one step only — no re-climb from standard
+      && climbProxyLower && climbProxyLower.proxyMax === 512,                  // ?proxy=512 still honored after the climb
+    JSON.stringify({ lowered: climbProxyLower?.proxyMax }),
   )
   const flagged = resolveBudget('?flagship=1', browserEightGB)
   const ultraReq = resolveBudget('?profile=ultra', browserEightGB)
@@ -1329,6 +1366,118 @@ try {
   const releasedAll = await pageW.evaluate(() => window.__seglab.releaseMemory().then(() => window.__seglab.engineState()))
   check('debug release-memory action clears residents', releasedAll && releasedAll.cachedImages === 0, JSON.stringify(releasedAll))
   await pageW.close()
+
+  /* ── Live measured-headroom climb (standard8 → standard) ── */
+  log('phase A8 (headroom climb) — proven headroom raises the live auto tier…')
+  // Headless SwiftShader is a fallback adapter → autoTier lite → ineligible,
+  // so stub a healthy non-fallback adapter + cores on the MAIN thread only
+  // (workers probe their own navigator; the engine is untouched).
+  const stubGpu = (page) => page.addInitScript(() => {
+    const adapter = {
+      isFallbackAdapter: false,
+      features: new Set(['shader-f16']),
+      limits: { maxTextureDimension2D: 16384, maxStorageBufferBindingSize: 1 << 30 },
+      info: { vendor: 'stub', architecture: 'test', device: '', description: 'verify stub adapter' },
+      requestDevice: async () => ({ destroy: () => {} }),
+    }
+    Object.defineProperty(navigator, 'gpu', { value: { requestAdapter: async () => adapter }, configurable: true })
+    Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8, configurable: true })
+    Object.defineProperty(navigator, 'userAgentData', { value: { mobile: false }, configurable: true })
+  })
+  const pageCl = await context.newPage()
+  // Earlier pinned phases persist seglab.profileOverride in this context's
+  // localStorage — the climb needs a genuine 'auto' source, so clear it.
+  await pageCl.addInitScript(() => {
+    window.__seglabNoRestore = true
+    try { localStorage.removeItem('seglab.profileOverride') } catch { /* off */ }
+  })
+  await stubGpu(pageCl)
+  pageCl.setDefaultTimeout(TIMEOUT_MS)
+  await pageCl.goto(`http://127.0.0.1:${port}/`)
+  await pageCl.waitForFunction(() => window.__seglabReady === true, null, { timeout: 30_000 })
+  await pageCl.evaluate((ls) => window.__seglab.loadDemo(ls), 1400)
+  const climbRun = await pageCl.evaluate(async () => {
+    const before = await window.__seglab.resourceBudget()
+    // Drive the governor directly: feed real-looking low bytes and run the 4
+    // clean cycles the headroom signal requires. Re-feed each cycle so a real
+    // background measurement can't overwrite the sample mid-gate.
+    for (let i = 0; i < 5; i += 1) {
+      window.__seglabGovernor.feedMeasurement(400)
+      window.__seglabGovernor.cycleNow()
+    }
+    const after = await window.__seglab.resourceBudget()
+    return {
+      before: { profile: before.profile, source: before.profileSource },
+      after: { profile: after.profile, source: after.profileSource, exportFullRes: after.exportFullRes, memBudgetMB: after.memBudgetMB, persist: after.embedPersist },
+    }
+  })
+  check(
+    'climb (live): 4 proven-headroom cycles raise a live standard8 session to standard (masks intact)',
+    climbRun.before.profile === 'standard8' && climbRun.before.source === 'auto'
+      && climbRun.after.profile === 'standard' && climbRun.after.source === 'auto-climb'
+      && climbRun.after.exportFullRes === true
+      && climbRun.after.memBudgetMB === 1900 && climbRun.after.persist === false,
+    JSON.stringify(climbRun),
+  )
+  const climbShed = await pageCl.evaluate(async () => {
+    await window.__seglab.relievePressure(2)
+    const shed = await window.__seglab.resourceBudget()
+    // Pressure poisoned the climb: further proven headroom must never re-climb.
+    for (let i = 0; i < 6; i += 1) {
+      window.__seglabGovernor.feedMeasurement(400)
+      window.__seglabGovernor.cycleNow()
+    }
+    const later = await window.__seglab.resourceBudget()
+    return {
+      shed: { profile: shed.profile, level: shed.pressureLevel, source: shed.profileSource },
+      later: { profile: later.profile, level: later.pressureLevel },
+    }
+  })
+  check(
+    'climb (live): pressure demotes the climbed tier back to standard8 AND poisons re-climbing',
+    climbShed.shed.profile === 'standard8' && climbShed.shed.level === 2
+      && climbShed.later.profile === 'standard8' && climbShed.later.level === 2,
+    JSON.stringify(climbShed),
+  )
+  await pageCl.close()
+
+  // Negative: a pinned manual override never climbs, however much headroom.
+  const pageClN = await context.newPage()
+  await pageClN.addInitScript(() => { window.__seglabNoRestore = true })
+  await stubGpu(pageClN)
+  await pageClN.addInitScript(() => { try { localStorage.setItem('seglab.profileOverride', 'standard8') } catch { /* off */ } })
+  pageClN.setDefaultTimeout(TIMEOUT_MS)
+  await pageClN.goto(`http://127.0.0.1:${port}/`)
+  await pageClN.waitForFunction(() => window.__seglabReady === true, null, { timeout: 30_000 })
+  await pageClN.evaluate((ls) => window.__seglab.loadDemo(ls), 1400)
+  const noClimb = await pageClN.evaluate(async () => {
+    for (let i = 0; i < 6; i += 1) {
+      window.__seglabGovernor.feedMeasurement(400)
+      window.__seglabGovernor.cycleNow()
+    }
+    const b = await window.__seglab.resourceBudget()
+    return { profile: b.profile, source: b.profileSource }
+  })
+  check(
+    'climb (live): a manual override is never climbed past',
+    noClimb.profile === 'standard8' && noClimb.source === 'manual',
+    JSON.stringify(noClimb),
+  )
+  // Backgrounding is housekeeping, not pressure: it must not ratchet the
+  // budget (the ratchet is one-way — a tab switch must not degrade the session).
+  const hideShed = await pageClN.evaluate(async () => {
+    Object.defineProperty(document, 'hidden', { value: true, configurable: true })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await new Promise((r) => setTimeout(r, 150))
+    const b = await window.__seglab.resourceBudget()
+    return { level: b.pressureLevel || 0 }
+  })
+  check(
+    'visibility: backgrounding drops reloadables WITHOUT ratcheting pressure',
+    hideShed.level === 0,
+    JSON.stringify(hideShed),
+  )
+  await pageClN.close()
 
   /* ─── Phase H: trusted-host (Phosmith pro) — HD/escalation/working ────── */
   const pageD = await newAppPage(context, '?flagship=0', 2400, { host: HOST_PRO })
