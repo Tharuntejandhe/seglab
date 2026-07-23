@@ -1,45 +1,128 @@
 /**
- * sw — offline cache for static model/wasm/library assets
- * ----------------------------------------------------------
- * Cache-on-fetch ONLY — nothing is fetched ahead of use; a resource enters
- * the cache the first time the app legitimately loads it. Never caches
- * per-image pixels, blobs, embeddings, non-GET, or partial responses.
- * HuggingFace weight fetches are left to transformers.js's own Cache-API
- * store to avoid double-storing ~40 MB.
+ * sw.js — SEGLAB Service Worker: persistent model cache
+ * -------------------------------------------------------
+ * Intercepts fetches for ONNX model files and the transformers.js bundle from
+ * HuggingFace and jsDelivr CDNs. After the first download, every subsequent
+ * request is served from the 'seglab-models-v1' Cache Storage bucket —
+ * eliminating repeated SlimSAM downloads on every visit. It never fetches
+ * resources itself: cache entries are created only after the editor requests
+ * them, so model/Wasm/detector prefetching cannot add a startup memory peak.
+ *
+ * Strategy: cache-first for model blobs; network-first (passthrough) for
+ * everything else. A stale model is never a problem here because the app
+ * pins exact transformers.js + model versions — the cache key is the full URL.
+ *
+ * Cache lifetime: perpetual (no TTL). The user can clear it from browser
+ * DevTools > Application > Cache Storage > seglab-models-v1, or we can bump
+ * CACHE_NAME to invalidate on a future app version bump.
  */
 
-const CACHE = 'seglab-static-v1'
+// v3 retires every cache bucket created while the automatic SAM3 upgrade was
+// available. Activation deletes obsolete buckets before serving future loads.
+const CACHE_NAME = 'seglab-models-v3'
 
-const CACHEABLE = [
-    /\/lib\//,
-    /\/models\//,
-    /\/public\/wasm\//,
-    /^https:\/\/cdn\.jsdelivr\.net\/npm\/(@huggingface\/transformers|onnxruntime-web)@/,
+/**
+ * URL prefixes that should be intercepted and cached.
+ * - HuggingFace CDN (model ONNX files, config JSONs, tokenizers …)
+ * - jsDelivr CDN (the pinned transformers.js ESM bundle)
+ */
+const MODEL_ORIGINS = [
+    'https://huggingface.co/',
+    'https://cdn-lfs.huggingface.co/',
+    'https://cdn-lfs-us-1.huggingface.co/',
+    'https://cdn.jsdelivr.net/npm/@huggingface/',
+    // HuggingFace uses a content-delivery proxy for large blobs:
+    'https://huggingface.co/resolve/',
 ]
 
-self.addEventListener('install', () => self.skipWaiting())
+// Same-origin static wasm (cv-refine) is cached after first load — never
+// prefetched, and per-image pixels/embeddings are never stored here.
+const isWasmFetch = (url) => url.includes('/public/wasm/')
 
-self.addEventListener('activate', (event) => {
-    event.waitUntil((async () => {
-        for (const key of await caches.keys()) {
-            if (key.startsWith('seglab-') && key !== CACHE) await caches.delete(key)
-        }
-        await self.clients.claim()
-    })())
+// Same-origin vendored assets (download-models.mjs → lib/ + models/).
+// Cached on first fetch like the CDN copies, so a deployed install pays the
+// weight download once rather than per visit.
+const isVendoredFetch = (url) => {
+    try {
+        const { origin, pathname } = new URL(url)
+        return origin === self.location.origin
+            && (pathname.startsWith('/models/') || pathname.startsWith('/lib/'))
+    } catch { return false }
+}
+
+const isModelFetch = (url) =>
+    MODEL_ORIGINS.some((prefix) => url.startsWith(prefix)) || isWasmFetch(url) || isVendoredFetch(url)
+
+// ── Install: take control immediately, no page refresh needed ────────────────
+self.addEventListener('install', (event) => {
+    // Skip the waiting phase so the new SW activates right away.
+    self.skipWaiting()
 })
 
+// ── Activate: claim all clients so existing tabs are covered at once ─────────
+self.addEventListener('activate', (event) => {
+    event.waitUntil(
+        (async () => {
+            // Remove any old cache versions if we ever bump CACHE_NAME.
+            const keys = await caches.keys()
+            await Promise.all(
+                keys
+                    .filter((k) => k.startsWith('seglab-models-') && k !== CACHE_NAME)
+                    .map((k) => caches.delete(k)),
+            )
+            // Claim clients without waiting for a page reload.
+            await self.clients.claim()
+        })(),
+    )
+})
+
+// The page is cross-origin isolated (COEP: require-corp), which blocks any
+// cross-origin subresource that lacks a CORP header. The CDN model *fallback*
+// (HuggingFace/jsDelivr) does not always send one, so re-tag those responses
+// here — the vendored same-origin path already carries CORP from the server.
+const isCrossOrigin = (url) => {
+    try { return new URL(url).origin !== self.location.origin } catch { return false }
+}
+const withCorp = async (response, url) => {
+    if (!isCrossOrigin(url) || !response || !response.ok) return response
+    const headers = new Headers(response.headers)
+    headers.set('Cross-Origin-Resource-Policy', 'cross-origin')
+    headers.set('Cross-Origin-Embedder-Policy', 'require-corp')
+    // Rebuild the response with the augmented headers (body is single-use, so
+    // callers pass a response they no longer need to read themselves).
+    const body = await response.blob()
+    return new Response(body, { status: response.status, statusText: response.statusText, headers })
+}
+
+// ── Fetch: cache-first for model files, passthrough for everything else ───────
 self.addEventListener('fetch', (event) => {
     const { request } = event
-    if (request.method !== 'GET' || !request.url.startsWith('http')) return
-    if (!CACHEABLE.some((re) => re.test(request.url))) return
-    event.respondWith((async () => {
-        const cache = await caches.open(CACHE)
-        const hit = await cache.match(request)
-        if (hit) return hit
-        const response = await fetch(request)
-        if (response.ok && response.status === 200) {
-            cache.put(request, response.clone()).catch(() => { /* quota */ })
-        }
-        return response
-    })())
+    // Only handle GET requests (POST/PUT/etc. are always passed through).
+    if (request.method !== 'GET') return
+    if (!isModelFetch(request.url)) return
+
+    event.respondWith(
+        (async () => {
+            const cache = await caches.open(CACHE_NAME)
+
+            // Cache hit → serve immediately (no network).
+            const cached = await cache.match(request)
+            if (cached) return withCorp(cached, request.url)
+
+            // Cache miss → fetch from network, store, then return.
+            try {
+                const response = await fetch(request)
+                // Only cache successful, non-partial responses.
+                if (response.ok && response.status === 200) {
+                    // clone() before consuming so we can both cache and return.
+                    cache.put(request, response.clone())
+                }
+                return withCorp(response, request.url)
+            } catch (err) {
+                // Network failure and no cache entry — let the error propagate
+                // so the app can show its own "model load failed" message.
+                throw err
+            }
+        })(),
+    )
 })

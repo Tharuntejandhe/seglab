@@ -1,161 +1,404 @@
-# SEGLAB — Full Plan
+# SEGLAB — Full Plan (merged with Phosmith Offline Pro)
+
+## 2026-07-17 — RAW develop fixture: first real sensor through LibRaw in the suite (CLOSED)
+
+The fixture-gated develop phase had never decoded a real RAW. Closed with
+`d750-lossless.nef` (repo root, untracked via `*.NEF`): Nikon D750 14-bit
+Lossless sample, CC0 from raw.pixls.us, sha256 `f90deb28…7665` verified against
+the index. Full suite green — 101 checks — including both fixture phases:
+- parser lifts the embedded preview (6016×4016, 975 KB JPEG + 746 KB proxy);
+- develop demosaics the sensor on-device: 6016×4016 → half-size 3016×2016 JPEG
+  (551 KB), decode-verified end to end.
+Rerun: `RAW_FIXTURE=d750-lossless.nef bun verify.mjs`.
+
+No preview-stripping (exiftool) needed — the parser phase REQUIRES previews
+present, and the develop hook (`developRawUrl`) drives LibRaw directly, so one
+ordinary lossless RAW satisfies both.
+
+Finding: the repo's Z 8 NEF (`2680558334.nef`) is High Efficiency (TicoRAW).
+LibRaw can't decode it ("Unsupported file format"), so HE/HE* can never use the
+develop fallback. By design this doesn't matter: HE NEFs always embed full-size
+previews (the Z 8 file carries three; parser phase passes on it), so the fast
+path covers them — the fallback exists for older preview-less files, which
+predate HE. A Z 8 set to Lossless compression produces develop-eligible files.
+
+## 2026-07-16 — on-device RAW develop: LibRaw wasm fallback for preview-less RAW (SHIPPED)
+
+Closes the last gap in RAW support. The fast path (`image-raw.js`) still lifts
+the camera's embedded JPEG preview for essentially every modern RAW with no
+sensor decode. The **rare RAW with no usable embedded preview** — which used to
+hard-fail with "export a JPEG/TIFF" — now falls back to an on-device develop:
+**LibRaw 0.22.2** compiled to WebAssembly with Emscripten (`cpp/raw_develop.cpp`
+→ `public/wasm/raw-develop.wasm`, ~1.0 MB). The worker demosaics the sensor and
+**libjpeg re-encodes in-worker**, so only a compact JPEG Blob rejoins the normal
+decode-to-proxy path — a full-res RGBA frame never crosses threads.
+
+Memory-safe by construction, respecting every locked-budget rule:
+- `half_size` demosaic (a ≤1024 px masking proxy never needs more; ~4× smaller).
+- Megapixel cap checked **before `unpack()`** (lite 40 · std 60 · pro 80 · ultra
+  100), so an image-bomb sensor is refused before LibRaw allocates it.
+- Lazy (~1 MB module fetched only when a preview-less RAW opens; never at boot,
+  never precached in `sw.js`) and the worker is **terminated after each develop**
+  because wasm memory only grows — termination returns it to the OS.
+- Off at memory pressure ≥ 2; SIMD-only build; failure surfaces the old error.
+
+Library choice, fact-checked against the source: RawSpeed (decoder only, no
+demosaic; speed-first, OOM-prone) and rawpy/imagecodecs (Python — no runtime,
+backend rejected twice) don't fit a zero-cloud browser. LibRaw is the only
+option that does and is itself hardened against giant/malicious allocations.
+
+Gates: static (artifacts exist; lazy+disposed+pressure-gated wiring; JPEG-Blob
+handoff, no RGBA across threads; `half_size` present) run always; a fixture-gated
+browser phase (`RAW_FIXTURE=…`) drives the real worker→wasm→LibRaw→libjpeg chain
+and asserts a decodable JPEG at the sensor's developed dimensions.
+
+## 2026-07-16 — crisp preview: proxy → 1024 + display decoupled from the model (SHIPPED)
+
+Two changes, both verify-green, that make a 45 MP DSLR photo look sharp on an
+unproven-memory browser without weakening the memory contract:
+
+1. **Interaction proxy 768 → 1024.** 1024 is SlimSAM's own internal encode
+   edge, so the model now sees its exact native frame (below it the encoder
+   upscales for no memory saving). cv-refine cap 768 → 1024, wasm heap
+   16 → 32 MiB (rebuilt). The memory-pressure floor still drops the proxy to
+   768. No device size is hard-coded anywhere — budgets are framed by trust,
+   not by a RAM number, and the device chip no longer prints one.
+
+2. **Display decoupled from the model buffer.** The on-screen photo (`#photo`)
+   is a separate crisp GPU-resident frame layered over the hidden ≤1024 model
+   buffer (`#view`, which still drives stage layout); the mask overlay stays on
+   the ≤1024 buffer. Display is sized bounded-safe per host: Chromium
+   scale-decodes the full frame cheaply; Safari uses the largest safe embedded/
+   working blob. `?display=native` opts into one full-res decode for a true
+   ~4 K preview (the user's chosen tradeoff over the RAW tab-kill risk);
+   `?display=off`/`<px>` tune it. Display-only, so honored even when locked.
+
+Gates: policy `?display` parsing; live `#photo` out-resolves `#view` while
+`#overlay` tracks `#view`; all lite proxy assertions updated 768 → 1024.
+Manually confirmed on real Google Chrome with the 45 MP NEF (2048 default /
+4096 native, mask aligned).
+
+## 2026-07-15 — client-side memory-safe architecture rewrite (SHIPPED)
+
+The upload→selection path is now hard-bounded for any machine whose memory
+headroom cannot be verified — which is every plain browser tab. Default
+architecture: compressed Blob → dedicated bounded decode
+worker → ≤768 px proxy → SlimSAM only → single segmentation worker → optional
+C++/wasm SIMD refinement → 1-channel Uint8 mask → UI render. All heavy
+operations serialize through one shared queue (`js/heavy-job-queue.js`).
+
+Invariant: uploading and selecting from a DSLR image never causes concurrent
+full-size decoding, heavyweight model init, model upgrades, detector loading,
+full-resolution crop escalation, or unbounded wasm allocation.
+
+Phased delivery (all landed together, each gated in `verify.mjs`):
+
+| Phase | Content | Status |
+|---|---|---|
+| M0 | Locked lite policy: browser-reported/unknown memory ⇒ lite; unsafe URL flags refused; SlimSAM-only segmentation | ✅ |
+| M1 | Shared heavy-job queue (concurrency 1, priorities, revision cancel) + serialized decode/model lifecycle; lazy model warm (post-proxy) | ✅ |
+| M2 | Dedicated bounded decode worker (header parse + `ImageDecoder`/`createImageBitmap` resize + working copy), transferables | ✅ |
+| M3 | One-embedding SlimSAM lifecycle: single resident entry with disposal, `releaseDocument` on import, no OPFS persistence and no pre-selection encode in lite | ✅ |
+| M4 | C++/wasm seeded cleanup, bounded hole fill, min-area removal, open/close (SIMD, fixed 16 MiB heap, 768 px cap, own worker) | ✅ |
+| M5 | Benchmarks (structured queue/decode logs) + memory-contract verify suites (policy, sizing, queue, embedding, wasm, static scans) | ✅ |
+| M6 | Optional edge-band refinement in wasm — only after profiling shows the JS guided filter is hot | ⏸ deferred |
+| M7 | Optional ROI-only GrabCut — only if measurements show need | ⏸ deferred |
+
+Notable policy pivots vs the earlier roadmap (superseding the 2026-07-12/15
+amendments below): browser-reported memory now resolves **lite** (was
+standard); SAM3/flagship has been retired from the interactive editor, so no
+host hint or URL can cause a second segmentation-model download, compile,
+cache, or upgrade; OPFS embedding persistence and encode-at-import are
+trusted-host features (lite forbids both); lite export is capped 4096 px/8 MP;
+the working copy is budget-sized (lite 1280 px). Higher trusted profiles may
+raise bounded proxy/export limits but still use SlimSAM only.
+
+Worker note: workers isolate lifecycle and keep the UI thread responsive —
+they do NOT multiply the machine's memory budget. WebAssembly here is
+browser-native sandboxed code with a fixed 16 MiB linear memory, not an
+arbitrary native executable.
+
+---
+
+## Archived pre-rewrite roadmap (superseded)
+
+The remaining record preserves earlier project decisions and benchmark history.
+It is not the current architecture: any references below to SAM3/flagship,
+multiple segmentation lanes, automatic upgrades, or unrestricted native export
+were superseded by the 2026-07-15 8 GB-safe rewrite above.
 
 **Goal:** browser-only, zero-cloud, any-device segmentation that matches top-tier
 product quality (Samsung AI-Eraser / Meta demo class). Free to build and run.
 Select anything in a photo via **clicks (±) / box / lasso / text**, get a
-precise, clean-edged mask, in real time.
+precise, clean-edged mask, and export it at the photo's **native resolution**.
+
+This plan merges the original SEGLAB roadmap with the *Phosmith Offline Pro
+Implementation Plan* (2026-07). Its cloud-fallback sibling spec was rejected:
+zero-cloud stays absolute.
 
 **Hard constraints (non-negotiable):**
-- Zero cloud — no image ever leaves the device. No server fallback, ever.
-- Any device — weak phones get a working tool, strong devices get flagship quality.
+- Zero cloud — no image, prompt, or mask ever leaves the device. No server fallback, ever.
+- Any device — equal FEATURES everywhere; hardware buys seconds and proxy size, never capability.
+  Target device for the "no loss" bar: M2 MacBook Air base (8 GB) = the dev machine.
 - Free — open weights, free CDN delivery, user's own compute.
 - Every phase ships with a headless verify gate (`bun verify.mjs`) before it counts as done.
 
 ---
 
-## Architecture (as built — post memory-safety rewrite, 2026-07)
-
-One reference frame: photo → **≤768 px proxy** (lite policy, js/policy.js).
-The original exists only as its compressed Blob; all prompts, masks, and the
-overlay live in the proxy frame; display scaling is CSS.
+## Architecture (target)
 
 ```
-Compressed original Blob (asset custody in app.js `doc`)
-  → decode-worker (bounded header parse via image-io.js → resize-during-decode)
-  → ≤768px proxy canvas
-  → heavy-job-queue.js — ONE lane, concurrency 1, revision-cancelled:
-       proxy-decode → model-warm → encode/prompt-decode → cv-refine → export
-  → sam-worker (SlimSAM only by default; ONE embedding slot, tensors disposed)
-  → cv-refine-worker (C++/wasm cleanup + guided-filter edges; JS fallback)
-  → one-channel Uint8 alpha masks everywhere; RGBA only at render/export
-SAM3 flagship: DORMANT — explicit confirmed opt-in only, never automatic.
+Original asset (native res — the export truth; asset-store.js)
+  ├─ interaction proxy ≤1024 (#view canvas — clicks/box/lasso/overlay)
+  ├─ detector canvas (OWLv2 model input FIXED 960² — canvas 960 Std/Pro, 640 Lite)
+  └─ refinement crops (original-res, ≤1024 model input — small objects + HD export)
+
+app.js / text-ui.js / export-hd.js (UI, candidates, HD export orchestration)
+  └─ sam-client.js  (worker transport + inline fallback; revisioned ops)
+      └─ sam-worker.js (serialize queue: ONE heavy GPU job at a time)
+          └─ sam-engine.js — lanes + provider registry, budget-aware residency
+              ├─ draft:    SlimSAM-77 quantized (~14 MB, Apache-2.0) — everywhere
+              ├─ flagship: SAM3-tracker q4f16 (297+5.4 MB) — WebGPU, hot-swap + replay
+              ├─ textLite: OWLv2 (Apache-2.0) via detect-engine.js — boxes only
+              └─ post pipeline (model-agnostic, every decode):
+                   lasso clamp → seeded cleanup + hole fill (sam-core.js)
+                   → guided-filter edge-band refinement (edge-refine.js)
+policy.js (budgets: Lite/Standard/Pro — static presets now, capability probe in M4)
 ```
 
-**Why one lane + one embedding:** on an 8 GB machine the crash mode was
-concurrent peaks (full-res decode × model warm × background SAM3 download).
-Strict serialization plus a single disposed embedding slot makes peak memory
-predictable; quality is preserved by the post pipeline, not by residency.
+**Why two segmentation lanes:** encoders are heavy, decoders are tiny. Draft
+makes the tool instantly usable; flagship encodes once (~5.6 s, cached) and
+every click is a ~630 ms decode. Prompts replay losslessly when a better lane
+arrives.
 
-**Why post-pipeline instead of bigger models only:** the 256² mask grid is a
-model-family limit. Hygiene + image-guided edge refinement fix artifacts that
-NO encoder size fixes, and they upgrade every current and future lane.
+**Why a text DETECTOR (not a text segmenter):** interaction-aware routing — a
+click already contains its own localization, so clicks never touch the
+detector; text is the only route that needs text-conditioned boxes, and boxes
+feed the SAME decoder every other prompt uses.
+
+**Why the post pipeline:** the 256² mask grid is a model-family limit. Hygiene
++ image-guided edge refinement fix artifacts no encoder size fixes, and they
+upgrade every current and future lane.
 
 ---
 
-## Phase log — DONE (all gated by verify.mjs, 10/10 green)
+## Phase log — DONE (all gated by verify.mjs)
 
 | # | What | Proof |
 |---|------|-------|
 | 0 | Standalone app, worker engine, click ± / box, encode-once cache | disc 6.2% vs 6.2% analytic; cached decode 75 ms |
 | 1 | Lasso = prompt generator (bbox + centroid point) + spatial clamp | lasso bbox = target near-pixel-perfect; clamp held |
 | 2 | Minute-object selection | 9 px dot selected, 0.05% vs 0.046% expected |
-| 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc (crumbs gone) |
+| 3 | Mask hygiene: keep clicked components + ≥1%-of-largest, fill pinholes | components = 1 on disc |
 | 4 | Edge-band refinement: gray guided filter, ±6 px band, soft output, E toggle | 3131 soft boundary px; post ~110 ms |
-| 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 confirmed headless; encode 5581 ms / decode 630 ms |
-
-## Memory-safety rewrite — DONE (2026-07, all gated by verify.mjs, 60+ checks green)
-
-| M | What | Proof |
-|---|------|-------|
-| M0 | Lite policy forced on ≤8GB/unknown; URL flags clamped; SAM3 de-automated (explicit `startFlagship` only); proxy 1024→768 | `?flagship=1&profile=ultra&proxy=max` inert; zero sam3 requests incl. bypass flags |
-| M1 | All runtime assets vendored (`scripts/download-models.mjs`: transformers.min.js, 4 ORT wasm, SlimSAM fp32+q8) | full selection with huggingface.co + jsdelivr route-aborted in a fresh cache-less context |
-| M2 | Shared heavy-job queue, concurrency 1, priorities, revision cancellation | log-proven: max 1 active ever; rejected job no deadlock; interaction preempts speculative |
-| M3 | Bounded decode pipeline: image-io header parsers (EXIF/ISOBMFF/TIFF+RAW preview), decode-worker, Blob-only custody | 6000×4000 → 768×512 proxy; import race: second wins; no main-thread full decode |
-| M4 | Revision protocol end-to-end; ONE embedding slot with `Tensor.dispose()`; one-channel alpha mask contract | resident=1 across N imports; import alone never encodes; stale results never commit |
-| M5 | C++/wasm cv_refine (seeded cleanup, holes, open/close; ≤768; fixed 16 MB heap) + cv worker with JS fallback | wasm suite green (dims reject, hole fill, min-area, transfer-not-copy); route-abort → JS fallback keeps selection |
-| M6 | Bounded export (≤4096px/8MP from Blob), pressure L1–L3, `[seglab][memory]` telemetry, SAM3 opt-in UX | 24 MP → 3464×2309 reduced=true; L2 kills wasm refine, selection survives; opt-in confirmed warn-only |
-| M7 | Service worker (cache-on-fetch, versioned), docs, static memory-contract suite | getImageData whitelist, no toDataURL/pyodide/opencv/WORKING_MAX_SIDE, sw precache-free |
-
-Deferred by design: crop escalation (P8) stays OFF under lite; guided filter
-in C++ (spec M6-optional) and ROI GrabCut (M7-optional) remain unimplemented
-until measurements demand them — the JS guided filter already runs in the cv
-worker off-main-thread.
+| 5 | SAM3 flagship lane: background download, hot-swap, prompt replay, sticky demote | lane=sam3 headless; encode 5581 ms / decode 630 ms |
 
 ---
 
-## Remaining phases (in order)
+## Merged roadmap — SHIPPED (in order; each phase verify-green, then committed)
 
-### P6 — Text prompts, stage 1: OWLv2 → boxes → same decoder
-- **Step:** add `Xenova/owlv2-base-patch16-ensemble` (Apache-2.0, in transformers.js)
-  as a `detect(text)` op in the engine; each detected box feeds the existing
-  SAM decoder; union masks for multi-instance ("all zebras").
-- **Why:** works on EVERY device today (no new licensing, no export work), and
-  reuses the whole existing mask pipeline. Enables the disabled Text button.
-- **Gate:** demo scene gains labeled objects; text "red circle" → same bbox/coverage
-  bars as the click test; multi-instance returns N components.
-- **Honest limit:** weaker than true SAM3 concepts on rare/tiny objects — stage 2 fixes that.
+All seven phases are on `main`, each with its verify gate passing at commit
+time. Full run: `bun verify.mjs` (Phases T, A–A8, B).
 
-### P7 — Candidate cycling + first-click granularity
-- **Step:** keep all 3 decoder candidates; Tab cycles part → whole → sub-part;
-  on a single first click, prefer the largest high-scoring candidate.
-- **Why:** the #1 cause of wasted corrective clicks is the model picking "part"
-  when the user meant "whole" (bike test: cost ~3 clicks).
-- **Gate:** verify asserts the 3 candidates differ and cycling changes the rendered mask.
+| Phase | Commit | Gate proof |
+|-------|--------|------------|
+| ENV | `798e2d3` | local playwright+chromium; missing playwright = hard fail |
+| M0  | `e217f9e` | overlapping selections → only the newest commits |
+| M1  | `d0a86e6` | 2400 px export dims exact; radial err 1.5 px ≤ 3 px |
+| M2  | `73117e6` | box → mask same bars as clicks; "all" → 2 components |
+| M3  | `92bb517` | 4000 px scene: escalated 1.0 px vs 5.3 px control |
+| M4  | `f6d48b3` | dev machine probes `pro`; `?force=wasm` runs full pipeline |
+| M5  | `8b62f07` | offline: click+text+export, 0 net fetches; revisit `encoded=false` |
 
-### P8 — Zoom-crop re-encode (minute-object equalizer)
-- **Step:** when the active selection bbox < ~15% of frame diagonal, re-encode a
-  padded crop around it at full 1024 and decode there; paste refined result back.
-- **Why:** a 100 px object in a 4000 px photo lands on ~25 px of encoder input —
-  no model segments that well. Cropping is up to ~10× effective resolution on
-  exactly the thing being selected. This, not model choice, is the real
-  "minute thing" solution for large photos.
-- **Gate:** synthetic scene at 4000 px with a 60 px object: boundary-F improves vs no-crop.
+### ENV — verify gate must be real on this machine ✅ `798e2d3`
+Local playwright dev-dependency + chromium; drop the foreign hard-coded path;
+missing playwright = hard fail (CI_SKIP_BROWSER=1 is the only skip).
 
-### P9 — Embedding persistence + encode-at-import (OPFS)
-- **Step:** persist flagship embeddings (~33 MB/image) to OPFS keyed by content
-  hash; start encoding at photo import (not first click); load embeddings on
-  revisit instead of re-encoding.
-- **Why:** kills the last wait. Reopening a photo = flagship-quality clicks with
-  ZERO encode wait, even on weak devices. Nobody in browser segmentation does this.
-- **Gate:** second page-load of same image: first click decodes with `encoded=false`.
+### M0 — Contracts: revision, cancel, serialize, policy stub ✅ `e217f9e`
+`document.revision` carried through client → worker → engine; `cancel` op
+(ONNX kernels can't be interrupted → in-flight jobs skip the post pipeline and
+return `{stale:true}`; queued jobs drop at dequeue; stale can never commit).
+`serialize()` queue = one heavy GPU job at a time (also caps 8 GB transient
+peaks). `policy.js` static Standard budget + URL overrides. Cache key scheme
+`doc:${assetHash}` / `crop:${assetHash}:${rect}`.
+**Gate:** overlapping selections → only the newest commits; older reported stale.
 
-### P10 — Text prompts, stage 2: true concept segmentation on-device (the flag-plant)
-- **Step:** quantize the SAM3 text stack (354M text encoder + ~30M detector) to
-  4-bit via the calibrated-WOQ recipe (per-block sensitivity scan, mixed
-  precision), targeting <300 MB for the full text lane. Primary vehicle:
-  **EfficientSAM3 / SAM3-LiteText** (Apache-2.0, weights released, ONNX export
-  still an upstream TODO — we do the export = first in a browser). Fallback
-  vehicle: samexporter on facebook/sam3 + custom quantization.
-- **Why:** "every zebra in one prompt" at SAM3 quality, fully local — no shipped
-  product has this in a browser. Odds: 60–75% the export+quant clears the
-  gates; if it misses, OWLv2 (P6) remains the text path and nothing regresses.
-- **Gate (hard, from the approved plan):** vs fp16 reference — mean mIoU ≥ 0.98
-  (min 0.95/fixture) AND boundary-F(2 px) ≥ 0.95, offline eval BEFORE any UI work.
+### M1 — Original asset + cropSegment + HD export (the "no loss" keystone) ✅ `d0a86e6`
+Today the original bitmap is CLOSED after building the ≤1024 proxy and the
+cutout exports from the proxy — native pixels are discarded. `asset-store.js`
+takes custody (Bitmap ≤24 MP, else Blob) + AssetTransform. New engine
+primitive `cropSegment` (padded original-res crop → encode under `crop:` key →
+prompts transformed → decode → post pipeline) — shared by HD export, M3
+escalation, and future "Improve detail". `edge-refine.js` gains a tiled
+entry (2048² tiles, 64 px overlap — window-local filter ⇒ seamless; never
+full-frame at 12 MP). Export: crop decode when meaningfully sub-frame +
+band-tiled guided refine at `band = clamp(round(6·scale), 6, 16)` → alpha
+composite → native-resolution PNG.
+**Gate:** 2400×1600 demo — export dims exact; radial boundary error ≤ 3 px vs
+the analytic disc.
 
-### P11 — Erase / edit actions on the mask (deferred by design)
-- **Step:** consume the mask: erase (LaMa-class inpainting ONNX in-browser),
-  cutout compositing, background swap.
-- **Why:** deferred earlier ("forget about erasing, we will do it later") — the
-  segmentation contract (mask ImageData + soft edges) is already the right input.
-- **Gate:** erase the demo disc → background continuity metric on the hole region.
+### M2 — Text select, local on every device (OWLv2) ✅ `73117e6`
+`onnx-community/owlv2-base-patch16-ensemble-ONNX` (the `-ONNX` suffix is part of
+the id; the Xenova export's class_head won't place on ORT-web v4). `text-core.js`
+(pure: phrase normalization with the "a photo of a X" template, all/every →
+multi-intent, NMS, mapping), `detect-engine.js` (pipeline-first adapter, q8 WASM
+— fp16 WebGPU only where `detectorWebGPU` allows it, since OWLv2's fixed 960²
+wedges 8 GB unified memory), `text-ui.js` (debounced input → numbered
+candidate chips → pick one / All N / re-phrase / Esc; state machine
+IDLE→DETECTING→CANDIDATES→SEGMENTING→READY). Chosen boxes → the SAME segment
+path as lasso (box + center point) → union via seeded hygiene. Residency:
+Lite disposes the detector after boxes (one-heavy rule); Standard idles it
+out ~10 s. Demo scene gains embedded photographic thumbnails (OWLv2 is
+out-of-distribution on flat synthetic shapes — photo patches carry the gates).
+**Gate:** text prompt lands a candidate on the photo patch → selecting it
+passes the same bbox/coverage bars as clicks; shape prompts WARN-only.
 
-### P12 — Platform slots (when the web catches up)
-- **COOP/COEP headers** if a hosted deployment wants multi-threaded WASM (faster
-  draft lane on weak devices). Local `http.server` skips this.
-- **WebNN execution provider** the day it ships stable (verified: Chrome origin
-  trial only, Android excluded, realistic 2027) — one config line in the EP
-  ladder, unlocks phone NPUs. Do not build on it before then.
+### M3 — Crop pyramid: interactive small-object escalation ✅ `92bb517`
+After post pipeline: bbox diag < 15% of proxy diag OR near-empty/solid →
+exactly ONE auto `cropSegment` escalation (original-res padded crop), merged
+back to the proxy mask + kept as an original-res `hdPatch` that HD export
+reuses. Auto on Standard/Pro; Lite = manual action (later).
+**Gate:** 4000 px scene, 60 px object — radial error/coverage materially
+better than a `?escalate=0` control run.
+
+### M4 — Capability probe fills policy.js ✅ `f6d48b3`
+Probe at boot (WebGPU adapter, deviceMemory, 512 px warm-up encode timing) →
+Lite/Standard/Pro budgets (proxy 768/1024/1024; detector canvas 640/960/960;
+flagship off/on/on; maxResidentHeavy 1/2/2; original Blob/Bitmap/Bitmap;
+HD export filter-only/full/full; detector dispose now/idle/resident).
+Pressure ladder: dispose OWLv2 → drop flagship embeddings → drop flagship
+session (extends the existing sticky demote). Memory check (Pro, 12 MP):
+~1.0 GB steady, ~2.6 GB transient peak, serialized — fits 8 GB.
+**Gate:** `?force=wasm` completes click + text + export (the "entire pipeline
+on weak devices" proof); default run on the dev machine reports `pro`.
+
+> **Amended 2026-07-12:** flagship is now **opt-in** (`?flagship=1`), off in every
+> preset. `navigator.deviceMemory` caps at 8, so an 8 GB Air and a 64 GB Studio
+> both read 8 — the probe can't confirm the headroom a co-resident 300 MB SAM3
+> needs, and auto-loading it thrashed the 8 GB target into swap (120 s decode
+> stalls). Profile still probes `pro` (sizing tier); the draft lane keeps full
+> capability. Also added `cropMaxSide` (1536/2048/4096) to bound native crop memory.
+>
+> **Amended 2026-07-12 (residency / 8K):** custody is now **blob-only** — a file
+> upload is never held as full-res RGBA. `importOriginal` reads dims from the
+> header (`image-io.js`) and decodes **straight to the ≤proxyMax proxy** via
+> `createImageBitmap` resize (JPEG scaled-DCT decode ⇒ an 8K/48 MP frame never
+> materializes); the compressed Blob is kept and escalation/export/detector
+> re-decode only the bounded region they need (`cropMaxSide` / `exportMaxSide` /
+> `DETECTOR_INPUT`). Rotated/exotic uploads fall back to the held decode (rare).
+> HD composite dropped to one full-frame buffer. Retires `bitmapMaxMP`. This
+> supersedes the M4 line "original Blob/Bitmap/Bitmap" — it is Blob everywhere now.
+>
+> **Amended 2026-07-12 (multi-select tab-kill):** a 2nd-object selection on a
+> DSLR photo froze ~35 s then Chrome killed the tab (screen recording). Fixes:
+> worker death now RESTARTS a fresh worker (≤2, memory reclaimed) instead of
+> falling inline — inline is boot-construction-failure only; escalation fires
+> once per SETTLED selection (skip while input pending + 250 ms settle);
+> overlay mask layers cached per mask object + rAF-coalesced painting (was 3
+> canvases + readbacks per pointermove); hdRefine passes its crop pixels/gray
+> into the encode (no duplicate crop-sized buffers); pro `cropMaxSide` 4096→2048
+> (2× model input; tensor peak quadruples per doubling); Chrome heap watchdog
+> sheds escalation → residents before the OS sheds the tab.
+>
+> **Amended 2026-07-12 (RAW + adaptive proxy):** camera RAW (.nef/.cr2/.arw/
+> .dng/…) is now supported by **lifting the embedded full-res JPEG preview**
+> (`image-raw.js`): a DSLR RAW is a container of sensor mosaic + metadata + one
+> or more developed JPEG previews — for a cutout tool the preview IS the photo,
+> so TIFF-IFD pointers (or a scan fallback for CR3/RAF) locate the largest one
+> and we slice out just its bytes (a 33 MB NEF → a 3 MB JPEG, reading ~3 MB of
+> the file, zero-cloud, no demosaic). Orientation baked in for portrait RAW; the
+> JPEG then rides the existing decode-to-proxy path. On-device demosaic (WASM
+> LibRaw) SHIPPED 2026-07-16 as the preview-less fallback — see the top entry.
+> Proxy is now **capability-adaptive**: probe →
+> `proxyMax` (wasm 768 / GPU 1024 / strong-GPU+f16 1280), `?proxy=<px>|off`
+> override; honest cap — the encoder ingests 1024² so bigger only buys click/
+> overlay precision. No server side exists to prune (static app; dev-only Playwright).
+>
+> **Amended 2026-07-12 (Safari RAW tab-kill — CapCut proxy):** Safari reloaded
+> the page on RAW selection — its `createImageBitmap` doesn't scaled-decode a
+> JPEG, so "decode to proxy" still materialized the full 45 MP (~182 MB), twice
+> (import + escalation). Fix, matching the CapCut proxy-edit model: interact on a
+> lightweight proxy, relink the mask to full-res at export. `extractRawPreview`
+> now returns the full-res preview + a small `proxyBlob` (the RAW's own smaller
+> embedded preview); `importOriginal({proxyBlob})` builds the proxy from it (a
+> ~7 MB decode, 26× less), full-res kept only for export. `escalateMaxMP`
+> (12/24/30) skips interactive native-crop escalation on huge originals — the
+> Chrome-only `performance.memory` watchdog can't help Safari, so the fix is
+> structural (never decode the big frame during interaction).
+>
+> **Amended 2026-07-15 (working copy — Safari big-JPEG / detector tab-kill):**
+> Safari never shipped `ImageDecoder` (MDN BCD: `version_added:false` — the
+> bounded WebCodecs path was dead code there), so a big plain JPEG (no RAW
+> preview to dodge into) full-raster-decoded at import AND on every
+> original-res re-decode: the detector frame and each escalation crop cost a
+> ~180–240 MB transient — the reload banner. Fix: on unbounded-decode hosts
+> the ONE unavoidable import decode also re-encodes a ≤4096 `workingBlob`
+> (RAW retains its small embedded preview instead — zero extra decodes);
+> detector frames + escalation crops decode from it (~45 MB transients),
+> escalation re-enables for big files/RAW (gates evaluate the working source),
+> and export alone bypasses it (`native:true`) — native-res export truth
+> unchanged (a bounded escalation patch is interaction-only; export re-decodes
+> natively). Crop prompts now scale by the real bitmap/rect ratio (latent bug:
+> a cropMaxSide-downscaled export crop had misplaced prompts, silently saved
+> by the IoU gate); working vs native crops key separately (`:w` suffix).
+> `?working=1|0` override; gate: Phase A4b (5000 px blob upload →
+> `workingActive`, escalation `decoded=true`, export dims exact).
+
+### M5 — Kill the waits + prove zero-cloud ✅ `8b62f07`
+Encode-at-import (eager background `encode` op — first click hits cache).
+OPFS persistence of document embeddings keyed by `lane:contentHash`
+(write-then-move, ~500 MB byte-capped LRU; read failure ⇒ re-encode). Crop
+keys stay memory-only. **Gates:** (A) warmed profile + `setOffline(true)` +
+request log ⇒ click/text/export still pass with zero successful fetches —
+zero-cloud as a tested property, not a promise (route-interception would
+bypass the HTTP cache and false-fail; models live in CacheStorage which serves
+offline); (B) revisit the same image ⇒ import encode + first click both
+`encoded=false`, restored tensors decode a correct disc.
+
+Note: the plan named *flagship* embeddings; shipped persisting whichever lane
+is active (draft in headless, flagship on WebGPU) since both are `doc:`-keyed
+and the pack format is lane-agnostic — a revisit skips the encode either way.
 
 ---
 
-## Device tier matrix (end state)
+## Future (after this tranche)
 
-| Device | Click/box/lasso | Text | Feel |
+- **Candidate cycling (old P7):** keep all 3 decoder candidates; Tab cycles
+  part → whole → sub-part; first click prefers the largest high-scoring one.
+- **SAM3 text stack (old P10):** quantized 354M text encoder + detector as a
+  drop-in behind the same `detect()` contract; hard offline gates (mIoU ≥ 0.98,
+  boundary-F ≥ 0.95 vs fp16) BEFORE any UI work. OWLv2 remains the floor.
+- **Detail pack (optional):** local trimap → ViTMatte-class matting for
+  hair/glass, Pro-tier, explicit user action — roadmap-only by decision.
+- **Erase / edit (old P11):** LaMa-class inpainting consuming the mask.
+- **Platform slots (old P12):** COOP/COEP for threaded WASM; WebNN when it
+  actually ships (realistic 2027).
+- **Lite "Improve detail" button:** manual crop escalation for devices where
+  auto is off.
+
+## Acceptance targets (engineering gates, not product claims)
+
+| Operation (warm) | Lite | Standard | Pro (M2 Air) |
 |---|---|---|---|
-| WebGPU (desktops, M-Macs, iOS 26 Safari, Chrome/Android 12+) | SAM3 q4f16 | LiteText (P10) or OWLv2 | flagship |
-| WASM-only (old phones, exotic browsers) | SlimSAM + full post pipeline | OWLv2 | draft lane, same UX, softer masks |
-| Any, revisited photo | cached embeddings (P9) | same | instant |
+| Correction click | ≤2 s | ≤700 ms | ≤700 ms flagship / ≤300 ms draft |
+| Text → boxes | ≤10 s | ≤5 s | ≤2.5 s |
+| HD export (12 MP) | ≤10 s filter-only | ≤6 s | ≤6 s |
+| Cached mask reuse | <100 ms | <100 ms | <100 ms |
 
-## Risks (with odds)
+## Risks (with mitigations)
 
-| Risk | Odds | Mitigation |
-|---|---|---|
-| EfficientSAM3 ONNX export fights back | ~30% | fallback: SAM2.1 ONNX (proven in-browser) for the mid lane; OWLv2 keeps text alive |
-| q4 text-stack quality below gates | ~25–40% | gates decide — ship OWLv2 as text default, keep flagship clicks |
-| WebGPU driver flakiness in the wild | ongoing | already handled: sticky lane demote + WASM fallback, user never sees a dead click |
-| SAM License (flagship lane) vs product plans | low | tracker lane is commercial-OK; Apache alternatives (SlimSAM/EfficientSAM3) exist for every lane |
+| Risk | Mitigation |
+|---|---|
+| Pinned transformers.js 4.2.0 OWLv2 API surface differs | M2 step-0 smoke test; adapter isolates it; raw-model fallback |
+| OWLv2 weak on synthetic demo shapes | photo thumbnails carry the text gates; shape prompts WARN-only |
+| WASM detect latency on weak devices (8–20 s cold) | progress UI + phrase cache; contingency: owlvit-patch32 Lite pack |
+| HD quality where crop decode is skipped (frame-filling objects) | radial-error gate decides; ≤2 crop decodes before filter-only |
+| 8 GB pressure with three resident sessions | serialize queue; OWLv2 idle-dispose; embeddings evict first |
+| WebGPU driver flakiness in the wild | already handled: sticky lane demote + WASM fallback |
 
 ## Working rules
-- Every phase lands with a `verify.mjs` check before it's called done.
+- Every phase lands with a `verify.mjs` check before it's called done; commit per phase.
 - Post-pipeline stays model-agnostic — anything added must upgrade all lanes.
 - Never trade the zero-cloud constraint for quality; trade download seconds instead.
+- Deterministic gates ride the draft lane; flagship checks are WARN-only headless,
+  confirmed manually in real Chrome on the dev machine.

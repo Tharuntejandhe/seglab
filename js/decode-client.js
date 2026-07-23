@@ -1,30 +1,21 @@
 /**
- * decode-client — main-thread API over decode-worker
- * ----------------------------------------------------
- * decodeProxy(blob, maxLongSide, revision) → { bitmap, original, proxy }.
- * Worker failure is sticky-inline (same degrade-don't-die contract as
- * sam-client): the fallback still uses the bounded decode path — an async
- * browser API, not a main-thread pixel loop.
+ * decode-client — main-thread transport to decode-worker, queued through the
+ * shared heavy-job scheduler so a decode can never overlap model work. If the
+ * worker cannot be constructed (file:// pages), the same decode-core code
+ * runs inline — identical bounds, sticky choice.
  */
 
-import { compositeCutout, decodeBoundedBitmap } from './image-io.js'
+import { enqueueHeavy, STALE } from './heavy-job-queue.js'
+import { readImageMeta } from './image-io.js'
+import { decodeBoundedBitmap, decodeWithWorkingCopy, decodeOpaqueBounded } from './decode-core.js'
+import { interactionPlan } from './proxy-plan.js'
 
-const DECODE_TIMEOUT_MS = 60 * 1000
-const EXPORT_TIMEOUT_MS = 120 * 1000
-
-const withTimeout = (promise, ms, label) =>
-    new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms)
-        promise.then(
-            (v) => { clearTimeout(timer); resolve(v) },
-            (e) => { clearTimeout(timer); reject(e) },
-        )
-    })
+export { STALE }
 
 let worker = null
 let workerBroken = false
 let seq = 0
-const pending = new Map() // id → {resolve, reject}
+const pending = new Map()
 
 const getWorker = () => {
     if (workerBroken) return null
@@ -33,74 +24,93 @@ const getWorker = () => {
         worker = new Worker(new URL('./decode-worker.js', import.meta.url), { type: 'module' })
         worker.onmessage = (event) => {
             const data = event.data || {}
-            const entry = pending.get(data.id)
+            const entry = pending.get(data.requestId)
             if (!entry) {
-                // Late reply to a timed-out request — release its bitmap.
-                try { data.result?.bitmap?.close?.() } catch { /* detached */ }
+                // Late reply for a timed-out/cancelled request: release its bitmaps.
+                try { data.bitmap?.close?.() } catch { /* not a bitmap */ }
+                try { data.display?.close?.() } catch { /* not a bitmap */ }
                 return
             }
-            pending.delete(data.id)
-            if (data.ok) entry.resolve(data.result)
-            else entry.reject(new Error(data.error || 'image decode failed'))
+            pending.delete(data.requestId)
+            if (data.type === 'error') entry.reject(new Error(data.error))
+            else entry.resolve(data)
         }
         worker.onerror = (event) => {
-            console.warn('[seglab] decode worker error; switching inline:', event?.message)
+            console.warn('[seglab][decode] worker error; restarting fresh:', event?.message)
             for (const [, entry] of pending) entry.reject(new Error(event?.message || 'decode worker crashed'))
             pending.clear()
-            try { worker.terminate() } catch { /* already dead */ }
+            try { worker.terminate() } catch { /* dead */ }
             worker = null
-            workerBroken = true
         }
         return worker
     } catch (err) {
-        console.warn('[seglab] decode worker construction failed; using inline decode:', err?.message)
+        console.warn('[seglab][decode] worker construction failed; decoding inline:', err?.message)
         workerBroken = true
         return null
     }
 }
 
-const roundtrip = (message, transfer, timeoutMs, label) => {
+const post = (msg, transfer = []) => {
     const w = getWorker()
     if (!w) return null
-    const id = `decode-${++seq}`
-    const reply = new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject })
+    seq += 1
+    const requestId = `d${seq}`
+    return new Promise((resolve, reject) => {
+        pending.set(requestId, { resolve, reject })
         try {
-            w.postMessage({ id, ...message }, transfer || [])
+            w.postMessage({ ...msg, requestId }, transfer)
         } catch (err) {
-            pending.delete(id)
+            pending.delete(requestId)
             reject(err)
         }
     })
-    return withTimeout(reply, timeoutMs, label).finally(() => pending.delete(id))
 }
 
-export const decodeProxy = async (blob, maxLongSide, revision = 0) => {
-    const viaWorker = roundtrip({ op: 'decode-proxy', revision, blob, maxLongSide }, null, DECODE_TIMEOUT_MS, 'Image decode')
-    if (viaWorker) {
-        try {
-            return await viaWorker
-        } catch (err) {
-            if (!workerBroken) throw err
-            console.warn('[seglab] retrying decode inline after worker failure')
-        }
-    }
-    return decodeBoundedBitmap(blob, maxLongSide)
+/** Header meta (dims + EXIF orientation) — cheap, not queued. */
+export const readMeta = async (blob) => {
+    const roundtrip = post({ type: 'meta', blob })
+    if (roundtrip) return (await roundtrip).meta
+    return readImageMeta(blob)
 }
 
-/** Explicit-export composite; mask alpha (and any bitmap) transfer in. */
-export const exportComposite = async ({ blob = null, bitmap = null, mask, caps }, revision = 0) => {
-    const transfer = [mask.alpha.buffer]
-    if (bitmap) transfer.push(bitmap)
-    const viaWorker = roundtrip({ op: 'export-composite', revision, blob, bitmap, mask, caps }, transfer, EXPORT_TIMEOUT_MS, 'Cutout export')
-    if (viaWorker) {
-        try {
-            return await viaWorker
-        } catch (err) {
-            if (!workerBroken) throw err
-            console.warn('[seglab] retrying export inline after worker failure')
-            throw err // mask buffer transferred into the dead worker — caller retries with a fresh copy
-        }
+/**
+ * Bounded proxy decode as ONE heavy job. Resolves { bitmap, working } or the
+ * STALE sentinel. The caller owns (and must close) the returned bitmap.
+ */
+export const decodeProxy = ({
+    blob, decodeW, decodeH, scale, orientation = 1,
+    wantWorking = false, workingMaxSide = 1280, displaySide = 0,
+    revision = null, isCurrent = null,
+}) => enqueueHeavy('decode-proxy', async () => {
+    const roundtrip = post({
+        type: 'decode-proxy', revision, blob, decodeW, decodeH, scale, orientation, wantWorking, workingMaxSide, displaySide,
+    })
+    if (roundtrip) {
+        const res = await roundtrip
+        return { bitmap: res.bitmap, working: res.working, display: res.display || null }
     }
-    return compositeCutout({ blob, bitmap, mask, caps })
-}
+    if (wantWorking) return decodeWithWorkingCopy(blob, { w: decodeW, h: decodeH }, scale, workingMaxSide, displaySide)
+    return { bitmap: await decodeBoundedBitmap(blob, decodeW, decodeH, scale, orientation), working: null, display: null }
+}, { priority: 'import', revision, isCurrent })
+
+/** Opaque-format decode (no parseable header): bounded inside the worker. */
+export const decodeOpaque = ({ blob, budget, revision = null, isCurrent = null }) => enqueueHeavy(
+    'decode-proxy',
+    async () => {
+        const slim = {
+            proxyMax: budget.proxyMax,
+            proxyMode: budget.proxyMode,
+            directMaxMP: budget.directMaxMP,
+            directMaxSide: budget.directMaxSide,
+            safeProxyMax: budget.safeProxyMax,
+        }
+        const roundtrip = post({ type: 'decode-opaque', revision, blob, budget: slim })
+        if (roundtrip) {
+            const res = await roundtrip
+            return { bitmap: res.bitmap, original: res.original, proxyActive: res.proxyActive }
+        }
+        const res = await decodeOpaqueBounded(blob, (w, h) => interactionPlan(w, h, slim))
+        return { bitmap: res.bitmap, original: { width: res.width, height: res.height }, proxyActive: res.proxyActive }
+    },
+    { priority: 'import', revision, isCurrent },
+)

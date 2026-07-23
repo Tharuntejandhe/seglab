@@ -3,12 +3,8 @@
  * ----------------------------------------------
  * Prompt/mask math for the on-device segmentation engine: mapping click/box
  * coordinates into the model's reshaped input space, building prompt tensor
- * payloads, picking the best of SAM's three candidate masks, and mask
- * hygiene. Dependency-free so it can be unit-tested headless.
- *
- * MASK CONTRACT: masks are one-channel Uint8Array alpha maps (0..255,
- * width*height bytes) everywhere. RGBA exists only at the final render
- * boundary (alphaToImageData).
+ * payloads, picking the best of SAM's three candidate masks, and converting
+ * a mask tensor into RGBA. Dependency-free so it can be unit-tested headless.
  *
  * Coordinate model: SAM resizes the source so its longest side hits the
  * model input size (1024) — `reshaped_input_sizes` is that resized [h, w].
@@ -73,31 +69,75 @@ export const buildBoxPrompt = (box, srcW, srcH, reshaped) => {
     }
 }
 
-/** Index of the best of SAM's three candidate masks (argmax IoU score). */
-export const pickBestMask = (scores) => {
-    let best = 0
-    for (let i = 1; i < scores.length; i += 1) {
-        if (scores[i] > scores[best]) best = i
+/**
+ * Under an ambiguous prompt, a candidate covering ≥ this much of the frame is
+ * SAM's whole-scene guess, not the clicked object. Whole-scene runaways reach
+ * ~85%, so 0.9 let them through; 0.75 catches them. Only overrides when a
+ * smaller candidate exists — a genuinely frame-filling subject has no smaller
+ * granularity level to fall to, so its argmax winner still stands.
+ */
+export const RUNAWAY_COVERAGE = 0.75
+
+/**
+ * Index of the best of SAM's three candidate masks.
+ *
+ * SAM emits its candidates as granularity levels (subpart → part → whole) and
+ * scores each one independently, so a plain argmax is only trustworthy when
+ * the prompt says which level was meant. Under an ambiguous prompt — a single
+ * positive click, no box — clicking one object in a field of near-identical
+ * objects lets the whole-scene candidate outscore the object actually pointed
+ * at, and the argmax winner comes back as the entire photo. In that case take
+ * the best-scoring candidate that still leaves a background behind. If every
+ * candidate is a runaway the subject may genuinely fill the frame, so the
+ * argmax winner stands.
+ */
+export const pickBestMask = (scores, { coverages = null, ambiguous = false } = {}) => {
+    const byScore = Array.from(scores.keys()).sort((a, b) => scores[b] - scores[a])
+    if (!ambiguous || !coverages) return byScore[0]
+    // An empty candidate is a miss, never an improvement on a runaway.
+    const scoped = byScore.find((i) => coverages[i] > 0 && coverages[i] < RUNAWAY_COVERAGE)
+    return scoped === undefined ? byScore[0] : scoped
+}
+
+/**
+ * Fraction of each candidate channel that is selected, sharing the one pass
+ * over the bool mask tensor ([1, C, H, W], Uint8 0/1) that every candidate
+ * lives in. Feeds pickBestMask's runaway test before a channel is expanded
+ * to RGBA — only the winner ever pays for that.
+ */
+export const maskChannelCoverages = (maskData, width, height, channels) => {
+    const size = width * height
+    const out = new Array(channels)
+    for (let c = 0; c < channels; c += 1) {
+        const offset = c * size
+        let count = 0
+        for (let i = 0; i < size; i += 1) if (maskData[offset + i]) count += 1
+        out[c] = count / size
     }
-    return best
+    return out
 }
 
 /**
  * Extract one channel of a post-processed bool mask tensor ([1, C, H, W],
- * Uint8 0/1 data) as a one-channel alpha map.
+ * Uint8 0/1 data) as opaque white-on-black RGBA.
  */
-export const maskChannelToAlpha = (maskData, width, height, channel) => {
+export const maskChannelToRGBA = (maskData, width, height, channel) => {
     const size = width * height
     const offset = channel * size
-    const alpha = new Uint8Array(size)
+    const rgba = new Uint8ClampedArray(size * 4)
     for (let i = 0; i < size; i += 1) {
-        alpha[i] = maskData[offset + i] ? 255 : 0
+        const v = maskData[offset + i] ? 255 : 0
+        const j = i * 4
+        rgba[j] = v
+        rgba[j + 1] = v
+        rgba[j + 2] = v
+        rgba[j + 3] = 255
     }
-    return alpha
+    return rgba
 }
 
-/** Coverage + bbox of an alpha mask (≥128 counts as selected). */
-export const summarizeMaskAlpha = (alpha, width, height) => {
+/** Coverage + bbox of a white-on-black RGBA mask (reads the R channel). */
+export const summarizeMaskRGBA = (rgba, width, height) => {
     let count = 0
     let minX = width
     let minY = height
@@ -106,7 +146,7 @@ export const summarizeMaskAlpha = (alpha, width, height) => {
     for (let y = 0; y < height; y += 1) {
         const row = y * width
         for (let x = 0; x < width; x += 1) {
-            if (alpha[row + x] >= 128) {
+            if (rgba[(row + x) * 4] >= 128) {
                 count += 1
                 if (x < minX) minX = x
                 if (x > maxX) maxX = x
@@ -121,18 +161,78 @@ export const summarizeMaskAlpha = (alpha, width, height) => {
     }
 }
 
-/** Render-boundary expansion: alpha mask → tinted ImageData (browser only). */
-export const alphaToImageData = (alpha, width, height, tint = [255, 255, 255]) => {
-    const out = new ImageData(width, height)
-    const d = out.data
-    const [r, g, b] = tint
-    for (let p = 0, i = 0; p < alpha.length; p += 1, i += 4) {
-        d[i] = r
-        d[i + 1] = g
-        d[i + 2] = b
-        d[i + 3] = alpha[p]
+/* ─── Committed-selection composition (click-union model) ─────────────────── */
+
+/** 1-channel copy of a white-on-black RGBA mask. Keeps the full 8-bit value —
+ *  the refined boundary band is soft alpha, and committing an object must not
+ *  harden its edges. */
+export const maskToChannel = (imageData) => {
+    const { data, width, height } = imageData
+    const chan = new Uint8Array(width * height)
+    for (let i = 0; i < chan.length; i += 1) chan[i] = data[i * 4]
+    return chan
+}
+
+/**
+ * Replay an ordered op stack ({op:'add'|'sub', chan}) into a white-on-black
+ * RGBA mask. Adds union per-pixel max (soft edges survive); subs zero where
+ * the sub channel is selected. `floor` is an optional pre-flattened starting
+ * channel. Returns null when nothing selected (callers keep the fast path).
+ */
+export const composeChannels = (ops, width, height, floor = null) => {
+    const size = width * height
+    const acc = floor ? Uint8Array.from(floor) : new Uint8Array(size)
+    for (const { op, chan } of ops) {
+        if (!chan || chan.length !== size) continue
+        if (op === 'sub') { for (let i = 0; i < size; i += 1) if (chan[i] >= 128) acc[i] = 0 }
+        else { for (let i = 0; i < size; i += 1) if (chan[i] > acc[i]) acc[i] = chan[i] }
+    }
+    let any = false
+    const rgba = new Uint8ClampedArray(size * 4)
+    for (let i = 0; i < size; i += 1) {
+        const v = acc[i]
+        if (v >= 128) any = true
+        const j = i * 4
+        rgba[j] = v; rgba[j + 1] = v; rgba[j + 2] = v; rgba[j + 3] = 255
+    }
+    return any ? { rgba, width, height } : null
+}
+
+/**
+ * Dilate a 1-channel mask by `radius` px (chebyshev). Subtract ops grow by a
+ * safety margin so removing an object never leaves a boundary-residue ring
+ * where two decodes of the same object disagree by a pixel.
+ */
+export const dilateChannel = (chan, width, height, radius = 2) => {
+    if (!radius) return chan
+    const out = new Uint8Array(chan.length)
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            if (!chan[y * width + x]) continue
+            const x0 = Math.max(0, x - radius)
+            const x1 = Math.min(width - 1, x + radius)
+            const y0 = Math.max(0, y - radius)
+            const y1 = Math.min(height - 1, y + radius)
+            for (let yy = y0; yy <= y1; yy += 1) out.fill(255, yy * width + x0, yy * width + x1 + 1)
+        }
     }
     return out
+}
+
+/** True when (x, y) — or any pixel within `tolerance` px — is selected. */
+export const pointInMask = (imageData, x, y, tolerance = 3) => {
+    if (!imageData) return false
+    const { data, width, height } = imageData
+    const x0 = Math.max(0, Math.round(x) - tolerance)
+    const x1 = Math.min(width - 1, Math.round(x) + tolerance)
+    const y0 = Math.max(0, Math.round(y) - tolerance)
+    const y1 = Math.min(height - 1, Math.round(y) + tolerance)
+    for (let yy = y0; yy <= y1; yy += 1) {
+        for (let xx = x0; xx <= x1; xx += 1) {
+            if (data[(yy * width + xx) * 4] >= 128) return true
+        }
+    }
+    return false
 }
 
 /**
@@ -144,7 +244,7 @@ export const alphaToImageData = (alpha, width, height, tint = [255, 255, 255]) =
  */
 export const validateClickMask = ({ coverage, bbox }) => {
     if (!bbox || coverage <= 0) return { usable: false, reason: 'empty mask (selection missed)' }
-    if (coverage >= 0.999) return { usable: false, reason: 'solid mask (object not separated)' }
+    if (coverage >= 0.9995) return { usable: false, reason: 'solid mask (object not separated)' }
     return { usable: true, reason: null }
 }
 
@@ -182,7 +282,7 @@ const labelComponents = (bin, w, h) => {
 
 /** Component label at (or within `radius` of) a seed point — a positive
  *  click can land a few pixels outside the mask the decoder returned. */
-const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
+const labelNearSeed = (labels, w, h, x, y, radius = 16) => {
     const cx = Math.round(x)
     const cy = Math.round(y)
     for (let r = 0; r <= radius; r += 1) {
@@ -210,16 +310,16 @@ const labelNearSeed = (labels, w, h, x, y, radius = 8) => {
  *   4. fill interior holes below ~1% of the mask area (upsample pinholes) —
  *      big legitimate gaps (background seen through a frame) stay open.
  *
- * @param {Uint8Array} alpha  one-channel mask, modified in place
+ * @param {Uint8ClampedArray} rgba  white-on-black mask, modified in place
  * @param {Array<[number, number]>} seeds  positive prompt points
  * @returns {{ kept: number, dropped: number, holesFilled: number }}
  */
-export const cleanupMaskAlpha = (alpha, w, h, seeds = []) => {
+export const cleanupMaskRGBA = (rgba, w, h, seeds = []) => {
     const size = w * h
     const bin = new Uint8Array(size)
     let fgArea = 0
     for (let i = 0; i < size; i += 1) {
-        if (alpha[i] >= 128) { bin[i] = 1; fgArea += 1 }
+        if (rgba[i * 4] >= 64) { bin[i] = 1; fgArea += 1 }
     }
     if (!fgArea) return { kept: 0, dropped: 0, holesFilled: 0 }
 
@@ -237,7 +337,7 @@ export const cleanupMaskAlpha = (alpha, w, h, seeds = []) => {
         keep.add(best)
     }
     for (const l of keep) largestKept = Math.max(largestKept, areas[l - 1])
-    const minUnseeded = Math.max(48, largestKept * 0.01)
+    const minUnseeded = Math.max(16, largestKept * 0.005)
     for (let k = 0; k < areas.length; k += 1) {
         if (!keep.has(k + 1) && areas[k] >= minUnseeded) keep.add(k + 1)
     }
@@ -247,7 +347,10 @@ export const cleanupMaskAlpha = (alpha, w, h, seeds = []) => {
         if (bin[i] && !keep.has(labels[i])) {
             bin[i] = 0
             dropped += 1
-            alpha[i] = 0
+            const j = i * 4
+            rgba[j] = 0
+            rgba[j + 1] = 0
+            rgba[j + 2] = 0
         }
     }
 
@@ -275,18 +378,67 @@ export const cleanupMaskAlpha = (alpha, w, h, seeds = []) => {
         for (let i = 0; i < size; i += 1) {
             if (fillLabel.has(bg.labels[i])) {
                 holesFilled += 1
-                alpha[i] = 255
+                const j = i * 4
+                rgba[j] = 255
+                rgba[j + 1] = 255
+                rgba[j + 2] = 255
             }
         }
     }
     return { kept: keep.size, dropped, holesFilled }
 }
 
-/** Component count of an alpha mask (verify/debug hook). */
-export const countMaskComponents = (alpha, w, h) => {
+/** Component count of a mask (verify/debug hook). */
+export const countMaskComponents = (rgba, w, h) => {
     const bin = new Uint8Array(w * h)
-    for (let i = 0; i < bin.length; i += 1) bin[i] = alpha[i] >= 128 ? 1 : 0
+    for (let i = 0; i < bin.length; i += 1) bin[i] = rgba[i * 4] >= 128 ? 1 : 0
     return labelComponents(bin, w, h).areas.length
+}
+
+/* ─── Crop-space helpers (M1 crop pyramid / HD export) ──────────────────── */
+
+/**
+ * Map proxy-space prompts into a crop's own pixel space. `proxyToOriginal`
+ * scales proxy → original coords; `rect` is the crop's origin+size in
+ * original coords. Points/boxes are clamped into the crop so a prompt a few
+ * pixels outside (padding round-off) still lands.
+ *
+ * @param {{ clicks?: Array<[number,number,0|1]>, box?: number[]|null,
+ *           clampPoly?: Array<[number,number]>|null, clampMargin?: number }} prompts
+ * @param {number} proxyToOriginal  originalW / proxyW
+ * @param {{ x:number, y:number, w:number, h:number }} rect
+ */
+export const mapPromptsToCrop = (prompts, proxyToOriginal, rect) => {
+    const px = (v) => Math.min(rect.w, Math.max(0, v * proxyToOriginal - rect.x))
+    const py = (v) => Math.min(rect.h, Math.max(0, v * proxyToOriginal - rect.y))
+    const clicks = (prompts.clicks || []).map(([x, y, label]) => [px(x), py(y), label])
+    const box = Array.isArray(prompts.box) && prompts.box.length === 4
+        ? [px(prompts.box[0]), py(prompts.box[1]), px(prompts.box[2]), py(prompts.box[3])]
+        : null
+    const clampPoly = Array.isArray(prompts.clampPoly) && prompts.clampPoly.length >= 3
+        ? prompts.clampPoly.map(([x, y]) => [px(x), py(y)])
+        : null
+    return {
+        clicks,
+        box,
+        clampPoly,
+        clampMargin: (prompts.clampMargin || 0) * proxyToOriginal,
+    }
+}
+
+/** IoU of two white-on-black RGBA masks of identical dims (R ≥ 128 = on).
+ *  Used to sanity-gate a crop re-decode against the mask the user approved:
+ *  a low IoU means the decoder grabbed a different object — distrust it. */
+export const maskIoU = (a, b) => {
+    let inter = 0
+    let union = 0
+    for (let i = 0; i < a.length; i += 4) {
+        const av = a[i] >= 128
+        const bv = b[i] >= 128
+        if (av && bv) inter += 1
+        if (av || bv) union += 1
+    }
+    return union ? inter / union : 0
 }
 
 /**

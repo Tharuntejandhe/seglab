@@ -1,27 +1,32 @@
 /**
- * cv-refine-client — main-thread API over cv-refine-worker
- * ----------------------------------------------------------
- * refine() transfers the mask buffers both ways (never copies). Worker
- * construction/crash is sticky-broken: callers then keep the engine's JS
- * pipeline — a lost refiner never costs a selection. dispose() releases the
- * worker under memory pressure; it can be recreated later.
+ * cv-refine-client — main-thread API over cv-refine-worker, queued through
+ * the shared heavy scheduler. Lazy: the worker/wasm load only when a first
+ * real refinement is requested. Failure is sticky and silent — the caller
+ * keeps the model's own mask; there is no retry loop and no fallback library.
  */
 
-const CV_TIMEOUT_MS = 30 * 1000
+import { enqueueHeavy, STALE } from './heavy-job-queue.js'
 
-const withTimeout = (promise, ms, label) =>
-    new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms)
-        promise.then(
-            (v) => { clearTimeout(timer); resolve(v) },
-            (e) => { clearTimeout(timer); reject(e) },
-        )
-    })
+const MAX_SIDE = 1024
+const REFINE_TIMEOUT_MS = 15_000
+
+// Wasm SIMD feature probe (the build is SIMD-only; unsupported hosts keep
+// the JS post pipeline instead).
+const SIMD_PROBE = new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0,
+    10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
+])
+let simdOk = null
+export const simdSupported = () => {
+    simdOk ??= (() => {
+        try { return WebAssembly.validate(SIMD_PROBE) } catch { return false }
+    })()
+    return simdOk
+}
 
 let worker = null
 let broken = false
 let seq = 0
-let guideRevision = 0
 const pending = new Map()
 
 const getWorker = () => {
@@ -31,77 +36,95 @@ const getWorker = () => {
         worker = new Worker(new URL('./cv-refine-worker.js', import.meta.url), { type: 'module' })
         worker.onmessage = (event) => {
             const data = event.data || {}
-            const entry = pending.get(data.id)
+            const entry = pending.get(data.requestId)
             if (!entry) return
-            pending.delete(data.id)
-            if (data.ok) entry.resolve(data.result)
-            else entry.reject(new Error(data.error || 'cv refinement failed'))
+            pending.delete(data.requestId)
+            if (data.type === 'result') entry.resolve(data)
+            else entry.reject(new Error(data.error || 'refine failed'))
         }
         worker.onerror = (event) => {
-            console.warn('[seglab] cv worker error; refinement disabled:', event?.message)
-            for (const [, entry] of pending) entry.reject(new Error(event?.message || 'cv worker crashed'))
+            console.warn('[seglab][cv] refine worker failed; keeping model masks:', event?.message)
+            for (const [, entry] of pending) entry.reject(new Error(event?.message || 'refine worker crashed'))
             pending.clear()
-            try { worker.terminate() } catch { /* already dead */ }
+            try { worker.terminate() } catch { /* dead */ }
             worker = null
-            broken = true
+            broken = true // no repeated retries
         }
         return worker
     } catch (err) {
-        console.warn('[seglab] cv worker construction failed:', err?.message)
+        console.warn('[seglab][cv] refine worker unavailable:', err?.message)
         broken = true
         return null
     }
 }
 
-const post = (op, payload, transfer, label) => {
-    const w = getWorker()
-    if (!w) return Promise.reject(new Error('cv worker unavailable'))
-    const id = `cv-${++seq}`
-    const roundtrip = new Promise((resolve, reject) => {
-        pending.set(id, { resolve, reject })
-        try {
-            w.postMessage({ id, op, ...payload }, transfer || [])
-        } catch (err) {
-            pending.delete(id)
-            reject(err)
-        }
-    })
-    return withTimeout(roundtrip, CV_TIMEOUT_MS, label).finally(() => pending.delete(id))
-}
+export const cvRefineAvailable = () => !broken && simdSupported()
+export const cvRefineLoaded = () => !!worker
 
-export const isCvUsable = () => !broken
-
-/** Ship the ≤768 proxy once per document as the guided-filter guide. */
-export const ensureGuide = async (revision, canvas) => {
-    if (guideRevision === revision) return
-    const bitmap = await createImageBitmap(canvas)
-    try {
-        await post('set-guide', { revision, bitmap }, [bitmap], 'cv guide')
-        guideRevision = revision
-    } catch (err) {
-        try { bitmap.close() } catch { /* transferred or closed */ }
-        throw err
-    }
-}
-
-/** Hygiene + edge refinement; alpha/alphaRaw buffers transfer both ways. */
-export const refine = ({ revision, width, height, alpha, alphaRaw, seeds = [], options = {} }) =>
-    post('refine', { revision, width, height, alpha, alphaRaw, seeds, options },
-        [alpha.buffer, alphaRaw.buffer], 'cv refine')
-
-export const resetCv = (revision) => {
-    guideRevision = 0
-    if (worker && !broken) post('reset', { revision }, null, 'cv reset').catch(() => { /* cold */ })
-}
-
-/** Memory pressure: drop the wasm heap + guide and stop the worker. */
-export const disposeCv = () => {
-    guideRevision = 0
+/** Terminate the worker (memory pressure ≥ 2, new document, before export). */
+export const disposeCvRefine = () => {
     if (!worker) return
-    post('dispose', {}, null, 'cv dispose')
-        .catch(() => { /* dying anyway */ })
-        .finally(() => {
-            try { worker?.terminate() } catch { /* already dead */ }
-            worker = null
+    try { worker.postMessage({ type: 'dispose' }) } catch { /* gone */ }
+    try { worker.terminate() } catch { /* gone */ }
+    worker = null
+    for (const [, entry] of pending) entry.reject(new Error('refine worker disposed'))
+    pending.clear()
+}
+
+/**
+ * Refine a one-channel mask. `alpha` is a Uint8Array (TRANSFERRED — detached
+ * after this call); returns a new Uint8Array, or null when refinement is
+ * unavailable/stale/failed (the caller keeps its original mask — pass a copy).
+ */
+export const refineAlpha = async ({
+    alpha, width, height, rgb = null, seeds = [], options = {}, revision = null, budget = {},
+}) => {
+    if (!cvRefineAvailable()) return null
+    if (budget.cvRefine === false || (budget.pressureLevel || 0) >= 2) return null
+    if (!alpha || Math.max(width, height) > MAX_SIDE || alpha.length !== width * height) return null
+
+    const result = await enqueueHeavy('cv-refine', () => {
+        const w = getWorker()
+        if (!w) return null
+        seq += 1
+        const requestId = `cv${seq}`
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                pending.delete(requestId)
+                console.warn('[seglab][cv] refine timed out; keeping model mask')
+                resolve(null)
+            }, REFINE_TIMEOUT_MS)
+            pending.set(requestId, {
+                resolve: (data) => { clearTimeout(timer); resolve(data) },
+                reject: (err) => {
+                    clearTimeout(timer)
+                    console.warn('[seglab][cv] refine failed; keeping model mask:', err?.message)
+                    resolve(null)
+                },
+            })
+            const transfer = [alpha.buffer]
+            if (rgb) transfer.push(rgb.buffer)
+            try {
+                w.postMessage({
+                    type: 'refine-mask',
+                    requestId,
+                    revision,
+                    width,
+                    height,
+                    rgb: rgb ? rgb.buffer : null,
+                    alpha: alpha.buffer,
+                    seeds,
+                    options,
+                }, transfer)
+            } catch (err) {
+                clearTimeout(timer)
+                pending.delete(requestId)
+                console.warn('[seglab][cv] refine post failed:', err?.message)
+                resolve(null)
+            }
         })
+    }, { priority: 'high', revision })
+
+    if (result === STALE || !result || result.stale) return null
+    return new Uint8Array(result.alpha)
 }

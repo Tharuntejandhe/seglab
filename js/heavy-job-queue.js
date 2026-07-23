@@ -1,104 +1,120 @@
 /**
- * heavy-job-queue — the single lane for memory-heavy work
- * ---------------------------------------------------------
- * Every operation with a large transient footprint (proxy decode, model
- * warm, image encode, prompt decode, CV refinement, export) runs here,
- * strictly one at a time — serialization is the memory guarantee: peaks
- * never stack. Cancellation is cooperative: queued jobs are rejected while
- * waiting; in-flight jobs run to completion and their consumers drop stale
- * results by revision. revision 0 marks image-agnostic jobs (model warm)
- * that survive image switches.
+ * heavy-job-queue — ONE memory-heavy operation at a time (pure, main thread).
+ * Image decode, model warm/encode/decode, detector runs, wasm CV refinement
+ * and export re-decodes all pass through here, so their peak allocations can
+ * never stack. Priorities (lower runs first): import 0 · interactive 1 ·
+ * normal 2 · idle 3; FIFO within a priority. A queued job re-checks currency
+ * before it starts; a stale job resolves to the STALE sentinel and never runs.
+ * Rejections release ownership (finally), so a failed job cannot deadlock.
  */
 
-export const PRIORITY = { interaction: 3, import: 2, model: 1, speculative: 0 }
+const PRIORITY = { import: 0, high: 1, interactive: 1, normal: 2, low: 3, idle: 3 }
 
-export class StaleJobError extends Error {
-    constructor(label) {
-        super(`stale heavy job: ${label}`)
-        this.name = 'StaleJobError'
-        this.stale = true
-    }
+/** Resolved instead of running when a queued job is no longer current. */
+export const STALE = Object.freeze({ stale: true })
+
+const state = {
+    queue: [],          // waiting jobs, kept sorted (priority, seq)
+    active: null,       // running job or null
+    seq: 0,
+    log: [],            // dev telemetry: { label, outcome, waitMs, runMs }
 }
 
-const queue = []
-let active = null // { label, revision } while a job runs
-let seq = 0
-let peakDepth = 0
-const eventLog = [] // ring buffer for tests/telemetry
-const LOG_MAX = 300
+const DEV = typeof location !== 'undefined' && /^(localhost|127\.)/.test(location.hostname || '')
+const logJob = (entry) => {
+    state.log.push(entry)
+    if (state.log.length > 200) state.log.shift()
+    if (DEV) console.log('[seglab][queue]', entry)
+}
 
-const logEvent = (ev, job) => {
-    eventLog.push({
-        t: Date.now(),
-        ev,
-        label: job.label,
-        revision: job.revision,
-        depth: queue.length,
-    })
-    if (eventLog.length > LOG_MAX) eventLog.splice(0, eventLog.length - LOG_MAX)
+const isStale = (job) => {
+    if (job.cancelled) return true
+    if (typeof job.isCurrent === 'function') {
+        try { if (!job.isCurrent()) return true } catch { return true }
+    }
+    if (job.signal?.aborted) return true
+    return false
 }
 
 const pump = () => {
-    while (!active && queue.length > 0) {
-        queue.sort((a, b) => b.priority - a.priority || a.seq - b.seq)
-        const job = queue.shift()
-        // Currency re-check at start: a job enqueued for a replaced image
-        // must never begin.
-        if (job.signal?.aborted || (job.isCurrent && !job.isCurrent())) {
-            logEvent('drop-stale', job)
-            job.reject(new StaleJobError(job.label))
-            continue
-        }
-        active = { label: job.label, revision: job.revision }
-        logEvent('start', job)
-        Promise.resolve()
-            .then(() => job.task({ signal: job.signal }))
-            .then(job.resolve, job.reject)
-            .finally(() => {
-                logEvent('end', job)
-                active = null
-                pump() // a failed job must not stall the lane
-            })
+    if (state.active || state.queue.length === 0) return
+    const job = state.queue.shift()
+    if (isStale(job)) {
+        logJob({ label: job.label, outcome: 'stale', waitMs: Date.now() - job.queuedAt, runMs: 0 })
+        job.resolve(STALE)
+        pump()
         return
     }
+    state.active = job
+    job.startedAt = Date.now()
+    Promise.resolve()
+        .then(() => job.task())
+        .then(
+            (value) => {
+                logJob({ label: job.label, outcome: 'done', waitMs: job.startedAt - job.queuedAt, runMs: Date.now() - job.startedAt })
+                job.resolve(value)
+            },
+            (err) => {
+                logJob({ label: job.label, outcome: 'error', waitMs: job.startedAt - job.queuedAt, runMs: Date.now() - job.startedAt })
+                job.reject(err)
+            },
+        )
+        .finally(() => {
+            state.active = null
+            pump() // ownership always released, even after a rejection
+        })
 }
 
+/**
+ * Enqueue `task` (async fn). Resolves with the task's value, or the STALE
+ * sentinel when the job was invalidated before it started. `revision` scopes
+ * the job for cancelHeavyBefore; `isCurrent` is re-checked at dequeue.
+ */
 export const enqueueHeavy = (label, task, {
-    priority = PRIORITY.model,
-    signal = null,
-    revision = 0,
-    isCurrent = null,
+    priority = 'normal', signal = null, revision = null, isCurrent = null,
 } = {}) => new Promise((resolve, reject) => {
-    const job = { label, task, priority, signal, revision, isCurrent, resolve, reject, seq: ++seq }
-    queue.push(job)
-    peakDepth = Math.max(peakDepth, queue.length + (active ? 1 : 0))
-    logEvent('enqueue', job)
+    const job = {
+        label,
+        task,
+        rank: PRIORITY[priority] ?? PRIORITY.normal,
+        seq: ++state.seq,
+        signal,
+        revision,
+        isCurrent,
+        cancelled: false,
+        queuedAt: Date.now(),
+        resolve,
+        reject,
+    }
+    let i = state.queue.length
+    while (i > 0 && (state.queue[i - 1].rank > job.rank)) i -= 1
+    state.queue.splice(i, 0, job)
     pump()
 })
 
-/** Reject queued jobs belonging to revisions older than `revision`. */
+/** Cancel every queued job whose revision is older than `revision`.
+ *  (An in-flight kernel cannot be interrupted; its consumer must reject the
+ *  result on the revision check instead.) */
 export const cancelHeavyBefore = (revision) => {
-    for (let i = queue.length - 1; i >= 0; i -= 1) {
-        const job = queue[i]
-        if (job.revision > 0 && job.revision < revision) {
-            queue.splice(i, 1)
-            logEvent('cancel', job)
-            job.reject(new StaleJobError(job.label))
-        }
+    for (const job of state.queue) {
+        if (job.revision !== null && job.revision < revision) job.cancelled = true
     }
 }
 
+/** New-document reset: drop every queued DOCUMENT-SCOPED job (one that
+ *  carries a revision or an isCurrent check). Document-agnostic jobs like a
+ *  model warm survive — the new document needs them too. */
 export const clearHeavyQueue = () => {
-    for (const job of queue.splice(0)) {
-        logEvent('clear', job)
-        job.reject(new StaleJobError(job.label))
+    for (const job of state.queue) {
+        if (job.revision !== null || typeof job.isCurrent === 'function') job.cancelled = true
     }
 }
 
 export const getHeavyQueueState = () => ({
-    activeLabel: active?.label || null,
-    activeRevision: active?.revision ?? null,
-    queuedCount: queue.length,
-    peakDepth,
-    log: eventLog.slice(),
+    activeLabel: state.active?.label || null,
+    activeRevision: state.active?.revision ?? null,
+    queuedCount: state.queue.length,
 })
+
+/** Dev/verify telemetry: recent job outcomes. */
+export const getHeavyQueueLog = () => state.log.slice()

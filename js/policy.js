@@ -1,179 +1,408 @@
 /**
- * policy — device-safety profiles and effective limits
- * ------------------------------------------------------
- * One frozen policy object rules every memory-relevant limit in the app:
- * proxy size, export caps, model residency, feature gates. The safety
- * precedence is strict and cannot be re-ordered by callers:
+ * policy — device profiles and runtime budgets (main thread).
+ * One budget object gates proxy size, residency, cache caps, escalation,
+ * HD export. Profiles scale HOW MUCH hardware a feature gets, never WHETHER.
  *
- *   hard device safety limit  >  memory-pressure reduction
- *     >  explicit URL parameter  >  normal feature request
+ * Memory-trust lock: a plain browser cannot verify its real memory headroom
+ * (`navigator.deviceMemory` is privacy-rounded and capped), so any budget not
+ * backed by a trusted Phosmith host hint is FORCED to the `lite` profile and
+ * URL parameters cannot raise its limits. Precedence:
+ *   hard device safety limit > memory pressure > URL parameter > feature request.
  *
- * On a device that reports ≤ 8 GB — or reports nothing at all — the `lite`
- * profile is FORCED and URL flags cannot raise any limit (browsers cap
- * navigator.deviceMemory at 8 and Safari omits it entirely, so in practice
- * lite is universal; that is the intended conservative outcome).
- * Downgrade-only flags (?flagship=0, ?wasm=1, ?debug=1) are always honored:
- * lowering a limit is never unsafe.
- *
- * SAM3 note: `flagship:false` means the heavyweight lane NEVER loads
- * automatically. `allowFlagshipOptIn` leaves one door open — an explicit,
- * confirmed user gesture in the UI (never a URL flag, never auto).
+ * Residency is blob-only: a file upload is never held as full-res RGBA (asset-
+ * store decodes straight to the proxy and re-decodes bounded regions on demand).
  */
 
-export const PROFILES = {
-    lite: Object.freeze({
+const PRESETS = {
+    lite: {
         profile: 'lite',
-
-        // Interaction
-        proxyMax: 768,
+        samIdleMs: 300_000,      // idle → release the ORT session arena (the real resident, ~0.5 GB GPU / ~3 GB WASM); next click rebuilds. App shortens to 45 s under pressure ≥ 2.
+        detectorScale: 's', // YOLOE text-lane scale (auto by tier; user-overridable)
+        // Soft ceiling (MB) the memory-governor watches measured agent-cluster
+        // bytes against (measureUserAgentSpecificMemory: main + workers + WASM).
+        // Normal WebGPU work measures well under this; a runaway WASM heap or an
+        // oversized export crosses it and sheds. GPU-side memory is a separate
+        // process the API can't see, so timer-drift is the paired swap signal.
+        memBudgetMB: 1800,
+        proxyMax: 1024,          // = SlimSAM's own internal encode edge; below it
+                                 // the model upscales (softer input) for no memory
+                                 // saving. The pressure floor drops it.
         proxyMode: 'auto',
+        // On-screen preview frame, decoupled from the model proxy: a GPU-resident
+        // display bitmap (not RGBA/tensor) so the photo looks crisp while the
+        // model keeps its bounded ≤proxyMax buffer. Sized bounded-safe per host.
+        displayMax: 2048,
+        displayMode: 'auto',     // 'auto' safe | 'native' opts into a full-res decode
         directMaxMP: 2,
         directMaxSide: 2048,
-
-        // Original/crop/export operations
         cropMaxSide: 1280,
         exportMaxSide: 4096,
         exportMaxMP: 8,
+        exportFullRes: false,    // safety floor: tight cutout, but crop stays cropMaxSide-bounded
         escalateMaxMP: 8,
-
-        // Model residency
-        draftCacheMax: 1,
+        draftCacheMax: 1,        // exactly one resident embedding
         flagshipCacheMax: 0,
         maxResidentHeavy: 1,
-
-        // Heavy optional features
-        flagship: false,          // no automatic SAM3, ever
-        allowFlagshipOptIn: true, // explicit confirmed user gesture only
-        detectorWebGPU: false,
+        flagship: false,
+        // Only enables the 151 MB Grounding DINO q4f16 attempt after the
+        // accelerator/f16 gate in sam-engine. OWLv2 still stays on WASM.
+        detectorWebGPU: true,
+        // Detector session stays warm across searches, evicted before the next
+        // SAM encode: dispose:'now''s memory ceiling without its per-search
+        // WebGPU rebuild (~13 s here).
+        detectorEvictOnEncode: true,
+        // Reclaim the warm session's (unified) GPU memory after this much
+        // quiet time — an idle 151 MB model must not pin an 8 GB host into
+        // swap. A later search pays one rebuild.
+        detectorIdleMs: 45_000,
+        // Baseline default: WASM. resolveBudget() promotes this to WebGPU
+        // whenever a usable non-fallback adapter is probed (gpuTier != 'none'),
+        // since GPU accel is independent of the memory tier. This false is the
+        // no-GPU / no-probe floor. Memory pressure does NOT clear it: WASM SlimSAM
+        // pins ~3 GB vs the GPU's ~0.5 GB, so the GPU is the memory-safe lane to keep.
+        samWebGPU: false,
         autoEscalate: false,
         hdExportDecode: false,
-        detectorDispose: 'now',
-        speculative: false,       // no prewarm/pre-encode jobs
-        wasmRefine: true,         // CV wasm allowed until pressure ≥ 2
-
-        // Runtime limits
+        detectorDispose: 'idle',
+        eagerEncode: true,       // bounded: one embedding, calm-gated, wasm lane
+        cvRefine: true,          // wasm mask cleanup (skipped at pressure ≥ 2)
+        rawDevelop: true,        // LibRaw develop for preview-less RAW; lazy,
+                                 // disposed after use, off at pressure ≥ 2
+        rawDevelopMaxMP: 40,     // refuse larger sensors here (bounds the peak)
+        embedPersist: false,     // OPFS embedding persistence off (packing peaks)
+        workingMaxSide: 1280,    // bounded re-decode copy cap (Safari-shaped hosts)
         pressureLevel: 0,
-    }),
-
-    // Data-only tiers for hypothetical >8 GB detection. Unreachable today:
-    // Chrome clamps deviceMemory reporting to 8 and Safari has no signal,
-    // so resolvePolicy can never select these from a real browser. They
-    // exist so the precedence logic has something to clamp DOWN from.
-    standard: Object.freeze({
-        profile: 'standard',
-        proxyMax: 1024,
+    },
+    // The one memory-safe tier an UNVERIFIED device may auto-reach (capability
+    // autoTier) and the ceiling for browser-signal auto-climb — pro/ultra stay
+    // trusted-host or manual-override only. Deliberately MEMORY-CLOSE to lite:
+    // its whole design is to be safe on the worst device that reaches it (an
+    // 8-core / 8 GB laptop that may be heavily loaded). It takes only the CHEAP
+    // quality wins — a crisper preview and a bigger, HD-decoded EXPORT (a
+    // transient, export-time cost) — and deliberately leaves OFF the expensive
+    // interaction-time native re-decode (`autoEscalate`), which pushed the NEF
+    // import+click peak to ~2.1 GB / ~1.15 GB resident (measured). Escalation and
+    // a larger export come only with a manual override to standard+ (the user
+    // vouching for a device with real headroom), still governor-guarded.
+    standard8: {
+        profile: 'standard8',
+        samIdleMs: 300_000,
+        detectorScale: 's',
+        memBudgetMB: 1900,
+        proxyMax: 1024,          // SlimSAM's native edge; higher only aids precision
         proxyMode: 'auto',
-        directMaxMP: 4,
+        displayMax: 2560,        // crisper preview (decoupled from the model proxy)
+        displayMode: 'auto',
+        directMaxMP: 3,
         directMaxSide: 2560,
-        cropMaxSide: 2048,
-        exportMaxSide: 6144,
-        exportMaxMP: 16,
-        escalateMaxMP: 16,
-        draftCacheMax: 2,
-        flagshipCacheMax: 1,
+        cropMaxSide: 1536,
+        exportMaxSide: 5120,
+        exportMaxMP: 12,         // the visible win: 8 → 12 MP cutouts (bounded peak)
+        exportFullRes: false,    // deliberately bounded (memory-close to lite)
+        escalateMaxMP: 12,
+        draftCacheMax: 1,        // still exactly one resident embedding
+        flagshipCacheMax: 0,
         maxResidentHeavy: 1,
         flagship: false,
-        allowFlagshipOptIn: true,
-        detectorWebGPU: false,
-        autoEscalate: false,
-        hdExportDecode: true,
-        detectorDispose: 'now',
-        speculative: false,
-        wasmRefine: true,
+        detectorWebGPU: true,
+        detectorEvictOnEncode: true,
+        detectorIdleMs: 120_000,
+        samWebGPU: true,
+        autoEscalate: false,     // interaction-time native re-decode → manual tiers only
+        hdExportDecode: true,    // sharp native-region export (bounded, export-time only)
+        detectorDispose: 'idle',
+        eagerEncode: true,
+        cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 50,
+        embedPersist: false,     // packing peak avoided on an unverified device
+        workingMaxSide: 2560,
         pressureLevel: 0,
-    }),
+    },
+    standard: {
+        profile: 'standard',
+        samIdleMs: 0,            // manual tier = user vouched headroom; no hibernate
+        detectorScale: 's',
+        memBudgetMB: 2800,
+        proxyMax: 1024,
+        proxyMode: 'auto',
+        displayMax: 2560,
+        displayMode: 'auto',
+        directMaxMP: 4,
+        directMaxSide: 4096,
+        cropMaxSide: 2048,
+        exportMaxSide: 8192,
+        exportMaxMP: 24,
+        exportFullRes: true,     // native-res tight cutout (export-time transient, crop-sized)
+        escalateMaxMP: 24,
+        draftCacheMax: 3,
+        flagshipCacheMax: 2,
+        maxResidentHeavy: 1,
+        flagship: false,
+        detectorWebGPU: true,
+        samWebGPU: true,
+        autoEscalate: true,
+        hdExportDecode: true,
+        detectorDispose: 'idle',
+        // 'standard' is now reachable by an unverified-memory device (the
+        // profile estimate's ceiling), not only a trusted Phosmith host — so
+        // it gets the same encode-time detector eviction lite has, not just
+        // pro/ultra's assumption of ample headroom.
+        detectorEvictOnEncode: true,
+        detectorIdleMs: 120_000,
+        eagerEncode: true,
+        cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 60,
+        embedPersist: true,
+        workingMaxSide: 4096,
+        pressureLevel: 0,
+    },
+    pro: {
+        profile: 'pro',
+        samIdleMs: 0,            // trusted big host — no hibernate
+        detectorScale: 'm',
+        memBudgetMB: 3600,
+        proxyMax: 1280,
+        proxyMode: 'auto',
+        displayMax: 3200,
+        displayMode: 'auto',
+        directMaxMP: 6,
+        directMaxSide: 6144,
+        cropMaxSide: 3072,
+        exportMaxSide: 10000,
+        exportMaxMP: 36,
+        exportFullRes: true,
+        escalateMaxMP: 36,
+        draftCacheMax: 4,
+        flagshipCacheMax: 3,
+        maxResidentHeavy: 2,
+        flagship: false,         // retired: SlimSAM is the only segmentation lane
+        detectorWebGPU: true,
+        samWebGPU: true,
+        autoEscalate: true,
+        hdExportDecode: true,
+        detectorDispose: 'idle',
+        detectorIdleMs: 180_000,
+        eagerEncode: true,
+        cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 80,
+        embedPersist: true,
+        workingMaxSide: 4096,
+        pressureLevel: 0,
+    },
+    ultra: {
+        profile: 'ultra',
+        samIdleMs: 0,
+        detectorScale: 'l',
+        memBudgetMB: 4600,
+        proxyMax: 1536,
+        proxyMode: 'auto',
+        displayMax: 4096,
+        displayMode: 'auto',
+        directMaxMP: 8,
+        directMaxSide: 8192,
+        cropMaxSide: 4096,
+        exportMaxSide: 12000,
+        exportMaxMP: 64,
+        exportFullRes: true,
+        escalateMaxMP: 64,
+        draftCacheMax: 6,
+        flagshipCacheMax: 4,
+        maxResidentHeavy: 2,
+        flagship: false,
+        detectorWebGPU: true,
+        samWebGPU: true,
+        autoEscalate: true,
+        hdExportDecode: true,
+        detectorDispose: 'idle',
+        detectorIdleMs: 180_000,
+        eagerEncode: true,
+        cvRefine: true,
+        rawDevelop: true,
+        rawDevelopMaxMP: 100,
+        embedPersist: true,
+        workingMaxSide: 4096,
+        pressureLevel: 0,
+    },
 }
 
-/** Fields a URL parameter may NEVER raise past the device profile. */
-const CEILING_FIELDS = [
-    'proxyMax', 'directMaxMP', 'directMaxSide', 'cropMaxSide',
-    'exportMaxSide', 'exportMaxMP', 'escalateMaxMP',
-    'draftCacheMax', 'flagshipCacheMax', 'maxResidentHeavy',
-]
+/** True when nothing above `lite` can be proven: no capability yet, or the
+ *  memory evidence is browser-reported/unknown (both unverifiable). */
+export const isMemoryLocked = (probed = null) => {
+    if (typeof probed === 'string') return false // explicit caller/test profile
+    if (!probed || typeof probed !== 'object') return true
+    return probed.memorySource !== 'phosmith'
+}
 
 /**
- * Resolve the boot policy from capability + URL search string.
- * `capability.deviceMemoryGB` of null/undefined (unknown) forces lite.
+ * Session budget: preset + capability probe + URL overrides. On a memory-
+ * locked device (unverified memory, or no probe yet) the profile is ALWAYS
+ * `lite` by default — `cap.estimatedProfile` (capability.js) is a real-signal
+ * guess surfaced for the UI to suggest, but it is deliberately never applied
+ * on its own: the live test suite's A-phase guarantees (bounded export, one
+ * resident embedding, no OPFS persistence, unsafe-flag lockout) assume every
+ * plain browser gets the same bounded floor regardless of its actual core
+ * count. Only the user's own profile-toggle choice — `override`, a persisted,
+ * deliberate decision, not a URL param a page could set for itself — raises
+ * it, and it may go beyond the estimate's own `standard` ceiling since the
+ * user is vouching for their own device. URL parameters may only LOWER
+ * limits on a locked budget — `?flagship=1`, `?proxy=max`, `?proxy=off`,
+ * `?profile=ultra`, `?working=1` are all refused there.
+ * `probed` is the boot capability object or a bare profile string (tests).
  */
-export const resolvePolicy = ({ capability = {}, search = '' } = {}) => {
-    const memGB = Number.isFinite(capability.deviceMemoryGB) ? capability.deviceMemoryGB : null
-    const liteForced = memGB === null || memGB <= 8
-
-    let params
-    try {
-        params = new URLSearchParams(search)
-    } catch {
-        params = new URLSearchParams('')
+export const resolveBudget = (search = typeof location !== 'undefined' ? location.search : '', probed = null, override = null, scaleOverride = null) => {
+    const params = new URLSearchParams(search)
+    const cap = (probed && typeof probed === 'object') ? probed : null
+    const locked = isMemoryLocked(probed)
+    const requestedProfile = locked ? null : params.get('profile')
+    const manualOverride = locked && override && PRESETS[override] ? override : null
+    // Adaptive tiering: on a locked (unverified) budget the default is the
+    // capability probe's autoTier (capability.js) — a capped, GPU/core-gated
+    // guess, never above standard8 — instead of a flat lite. It comes from
+    // hardware signals, not a URL param, so the unsafe-flag lockout still holds.
+    // Precedence: manual override (the user vouching, may exceed the ceiling) >
+    // autoTier > lite.
+    const autoTier = locked && cap && PRESETS[cap.autoTier] ? cap.autoTier : null
+    const name = locked
+        ? (manualOverride || autoTier || 'lite')
+        : (requestedProfile || (cap ? cap.profile : probed))
+    const budget = { ...(PRESETS[name] || PRESETS.lite) }
+    // Adaptive proxy: the probe sizes it to the device. An explicit profile is
+    // a developer override and gets that profile's normal proxy instead.
+    if (cap && cap.proxyMax && !requestedProfile) {
+        budget.proxyMax = locked ? Math.min(cap.proxyMax, budget.proxyMax) : cap.proxyMax
     }
-
-    // Profile request honored only above the hard device limit.
-    const requested = params.get('profile')
-    const base = (!liteForced && requested && PROFILES[requested]) ? PROFILES[requested] : PROFILES.lite
-    const policy = { ...base }
-
-    if (!liteForced) {
-        // Size upgrades allowed above the hard limit. `?flagship=1` is inert
-        // on every tier: the only path to SAM3 is the confirmed UI opt-in.
-        if (params.get('proxy') === 'max') policy.proxyMax = Math.max(policy.proxyMax, 1024)
+    if (cap) {
+        budget.memoryGB = cap.memoryGB || 0
+        budget.memorySource = cap.memorySource || 'unknown'
+        budget.vramGB = cap.vramGB || 0
+        budget.gpuTier = cap.gpuTier || 'none'
+        budget.resourceMode = cap.resourceMode || 'balanced'
+        budget.hostManaged = !!cap.hostManaged
+        budget.flagshipEligible = !!cap.flagshipEligible
+        budget.textureLimit = cap.textureLimit || 0
+        // GPU acceleration is independent of the memory tier (see capability.js):
+        // any usable, non-fallback WebGPU adapter runs SlimSAM on the GPU, even
+        // on the memory-locked lite baseline. SlimSAM is ~14 MB and the proxy is
+        // bounded, so the upload burst is small; segment() still falls back to
+        // WASM on any runtime failure, and ?force=wasm / memory pressure override.
+        budget.samWebGPU = cap.gpuTier !== 'none'
     }
+    budget.memoryLocked = locked
+    // How `name` was picked — the profile toggle reads this to label its
+    // "Auto" option and to know whether the user has already overridden it.
+    // 'auto' only when the capability auto-tier actually RAISED above the lite
+    // floor; an autoTier that resolves to lite (no signal, or capped down) is
+    // just the default floor.
+    budget.profileSource = locked
+        ? (manualOverride ? 'manual' : (autoTier && autoTier !== 'lite' ? 'auto' : 'default'))
+        : (cap ? 'trusted' : 'preset')
+    if (cap?.memorySource === 'unknown') budget.memoryUncertain = true
 
-    // Downgrade-only flags: always safe, always honored.
-    if (params.get('flagship') === '0') { policy.flagship = false; policy.allowFlagshipOptIn = false }
-    const proxyParam = params.get('proxy')
-    if (proxyParam && /^\d+$/.test(proxyParam)) {
-        policy.proxyMax = Math.min(policy.proxyMax, Math.max(64, Number(proxyParam)))
-    }
-    policy.forceWasm = params.get('wasm') === '1'
-    policy.debug = params.get('debug') === '1'
-
-    // HARD DEVICE SAFETY LIMIT — nothing above may survive this clamp.
-    if (liteForced) {
-        const lite = PROFILES.lite
-        for (const field of CEILING_FIELDS) {
-            policy[field] = Math.min(policy[field], lite[field])
+    const adaptiveProxyMax = budget.proxyMax
+    const pq = params.get('proxy')
+    if (locked) {
+        // Only a LOWER manual proxy is honored; off/max/large are unsafe here.
+        if (pq && Number(pq) >= 256 && Number(pq) < adaptiveProxyMax) {
+            budget.proxyMode = 'manual'
+            budget.proxyMax = Math.round(Number(pq))
         }
-        policy.profile = 'lite'
-        policy.flagship = false
-        policy.detectorWebGPU = false
-        policy.autoEscalate = false
-        policy.hdExportDecode = false
-        policy.speculative = false
-        policy.detectorDispose = 'now'
+    } else if (pq === 'off') {
+        budget.proxyMode = 'disabled'
+        budget.proxyMax = 0
+        budget.safeProxyMax = adaptiveProxyMax
+    } else if (pq === 'max') {
+        budget.proxyMode = 'manual'
+        budget.proxyMax = 4096
+    } else if (pq && Number(pq) >= 256) {
+        budget.proxyMode = 'manual'
+        budget.proxyMax = Math.min(4096, Math.round(Number(pq)))
     }
 
-    policy.liteForced = liteForced
-    policy.deviceMemoryGB = memGB
-    return Object.freeze(policy)
+    // SAM3/flagship is retired from the editor's interactive architecture.
+    // Keep this explicit value for integrations and diagnostics, but never
+    // accept a query parameter or host hint that would allocate a second
+    // segmentation model alongside SlimSAM.
+    budget.flagship = false
+
+    if (params.get('force') === 'wasm') { budget.forceWasm = true; budget.flagship = false }
+    if (params.get('escalate') === '0') budget.autoEscalate = false
+    // Bounded "working" re-decode copy for hosts whose image decode is
+    // unbounded (Safari). auto = feature-detect; ?working=1 forces it only on
+    // trusted budgets (verify uses it); ?working=0 disables anywhere.
+    if (params.get('working') === '0') budget.workingMode = 'off'
+    else if (!locked && params.get('working') === '1') budget.workingMode = 'force'
+
+    // On-screen preview quality (display only — never touches the segmentation
+    // memory contract, so it is honored even on a locked budget). `native` opts
+    // into a one-time full-res decode for a crisp preview on unbounded-decode
+    // hosts (Safari); `off` pins the preview to the model proxy; a number caps
+    // the display long edge lower.
+    const dq = params.get('display')
+    if (dq === 'native') budget.displayMode = 'native'
+    else if (dq === 'off') budget.displayMode = 'off'
+    else if (dq && Number(dq) >= 256) budget.displayMax = Math.min(4096, Math.round(Number(dq)))
+
+    // Export resolution: full opts into a native-res tight cutout (an
+    // export-time transient, not a resident tier), bounded forces the tier
+    // cropMaxSide cap. Raising respects a locked trusted-host contract; lowering
+    // is always allowed.
+    const xq = params.get('export')
+    if (xq === 'bounded') budget.exportFullRes = false
+    else if (!locked && xq === 'full') budget.exportFullRes = true
+
+    // YOLOE text-lane scale: preset detectorScale is the auto pick; a deliberate
+    // user choice (scaleOverride, persisted) or ?yoloe= forces it. 'off' disables
+    // the lane. Safe on a locked budget — every scale's WebGPU footprint is tens
+    // of MB, not a memory tier.
+    const yoloeChoice = scaleOverride || params.get('yoloe')
+    if (yoloeChoice === 'off') budget.yoloe = false
+    else if (['n', 's', 'm', 'l', 'x'].includes(yoloeChoice)) budget.detectorScale = yoloeChoice
+    return budget
 }
 
 /**
- * Apply memory-pressure reductions on top of the boot policy.
- * Pure — callers re-derive whenever the pressure level changes.
- *   L1: stop speculative work, drop any non-current embedding.
- *   L2: + no wasm refinement, crop ops capped at 768, no HD re-decode.
- *   L3: + clear embedding after each run, exports ≤ 4 MP, safe-mode banner.
+ * Runtime safety valve — a one-way ratchet. It never re-enables a feature or
+ * raises a cap; it reduces future allocation sizes and turns automation off.
+ *   1: drop detector + prewarm, one embedding max
+ *   2: +no wasm refine, no escalation/HD decode, crops ≤ 1280
+ *   3: +proxy ≤ 768, exports capped (lite: 4 MP)
  */
-export const effectivePolicy = (policy, pressureLevel = 0) => {
-    const level = Math.max(policy.pressureLevel || 0, pressureLevel | 0)
-    if (level <= 0) return policy
-    const eff = { ...policy, pressureLevel: level }
-    if (level >= 1) {
-        eff.speculative = false
-        eff.clearUnusedEmbeddings = true
-        eff.detectorWebGPU = false
-        eff.allowFlagshipOptIn = false
+export const applyMemoryPressure = (budget, level = 1) => {
+    const nextLevel = Math.max(Number(budget?.pressureLevel) || 0, Math.min(3, Math.max(0, Math.floor(level))))
+    if (!nextLevel) return budget
+    const next = { ...budget, pressureLevel: nextLevel, autoEscalate: false }
+    if (nextLevel >= 1) {
+        next.maxResidentHeavy = 1
+        next.draftCacheMax = Math.min(next.draftCacheMax || 1, 1)
+        next.flagshipCacheMax = 0
+        next.detectorWebGPU = false
+        // NB: pressure does NOT demote SlimSAM to WASM. Measured, WASM SlimSAM
+        // pins ~3 GB vs the GPU's ~0.5 GB, so forcing WASM under memory pressure
+        // makes swap WORSE — the GPU is the memory-safe lane and is kept. Device
+        // demotion stays failure-gated in sam-engine (WEBGPU_FAILURE_LIMIT / OOM).
+        next.eagerEncode = false
     }
-    if (level >= 2) {
-        eff.wasmRefine = false
-        eff.cropMaxSide = Math.min(eff.cropMaxSide, 768)
-        eff.hdExportDecode = false
-        eff.autoEscalate = false
+    if (nextLevel >= 2) {
+        next.cropMaxSide = Math.min(next.cropMaxSide || 1280, 1280)
+        next.escalateMaxMP = Math.min(next.escalateMaxMP || 8, 8)
+        next.displayMax = Math.min(next.displayMax || 1600, 1600)
+        next.hdExportDecode = false
+        next.exportFullRes = false // export a bounded (cropMaxSide) cutout under real pressure
+        next.cvRefine = false
+        next.rawDevelop = false
     }
-    if (level >= 3) {
-        eff.clearEmbeddingAfterRun = true
-        eff.exportMaxMP = Math.min(eff.exportMaxMP, 4)
-        eff.proxyMax = Math.min(eff.proxyMax, 768)
-        eff.safeModeBanner = 'Memory pressure detected — running in safe mode.'
+    if (nextLevel >= 3) {
+        const exportCap = next.profile === 'lite' ? 4 : (next.profile === 'standard' ? 16 : 24)
+        next.exportMaxMP = Math.min(next.exportMaxMP || exportCap, exportCap)
+        next.exportMaxSide = Math.min(next.exportMaxSide || 4096, next.profile === 'lite' ? 4096 : 6144)
+        next.proxyMax = Math.min(next.proxyMax || 768, 768)
+        next.displayMax = Math.min(next.displayMax || 1280, 1280)
+        if (next.safeProxyMax) next.safeProxyMax = Math.min(next.safeProxyMax, 768)
     }
-    return Object.freeze(eff)
+    return next
 }
+
+export const PROFILE_PRESETS = PRESETS
