@@ -1,5 +1,79 @@
 # SEGLAB — Full Plan (merged with Phosmith Offline Pro)
 
+## 2026-07-23 — GPU-first detect lanes, int8 wasm floor, 8 GB import/search hardening (SHIPPED)
+
+Models are now fully materialized locally (previously the YOLO/CLIP lanes 404'd
+on a fresh checkout): YOLOE-26 s/m/l exported (46/99/117 MB fp32 + 4585-label
+vocabs), YOLO-World s/m/l (51/114/187 MB fp32), the CLIP ViT-B/32 vocab table
+(4585×512 fp32, 9.4 MB — transformers 5.2's `position_ids` UNEXPECTED warning
+is benign, table validated end-to-end: 'cat' 0.925 / 'television' 0.919 /
+'banana' → ∅ on COCO fixtures), and `lib/ort-web/` vendored via
+`download-models --detector`.
+
+**GPU-first everywhere (user requirement):** both detect lanes take an EP
+preference and default `['webgpu','wasm']` — Apple/NVIDIA/AMD and Intel/AMD
+iGPUs all ride WebGPU; wasm is the floor, and the pressure ratchet's
+`detectorWebGPU=false` now actually pins it (the lanes previously ignored it).
+YOLO-World's old wasm-first ordering (unverified GPU parity) is replaced by
+runtime trust: a flooded score field (≥2000/8400 anchors past threshold) or a
+first-ever zero-det GPU result is cross-checked once on wasm; disagreement
+sticky-demotes that worker to wasm, agreement trusts the GPU thereafter. Cost:
+≤1 extra wasm inference per worker spawn.
+
+**int8 wasm floor (QDQ):** `quantize_lanes` static-quantizes backbone+neck
+(QDQ QUInt8/QInt8 per-channel, MinMax over 36 COCO frames through the exact
+browser preprocessing; detect head excluded — whole-graph collapsed to zero
+dets, head-included MinMax/Entropy both hallucinated 0.88 'stormy'/'night sky'
+labels). Shipped: YOLO-World s/m/l `.int8.onnx` (~20 MB vs 51 fp32 at s; drift
+≤0.05, IoU ≥0.99, 'cat' 0.974) — wasm loads int8-first, fp32 fallback; WebGPU
+keeps fp32. YOLOE int8 was REJECTED (same hallucinations persisted with head
+fp32) — YOLOE stays fp32 on both EPs; correctness beats the 18% CPU win in the
+lane whose labels drive selection.
+
+**Search latency:** one detector frame per document (`text-ui` caches the 640²
+letterbox keyed by transform identity — repeat searches skip the bounded
+re-decode + readback) and the worker now receives a disposable copy, fixing a
+real bug: the transfer detached `frame.data` before `focusRequestedColor`/
+`dominantColorForBox` read it, so colour-qualified ranking and the colour facet
+were silently dead on the worker path.
+
+**8 GB import spike (Z 8 NEF, red memory pressure):** the import path was
+already guarded (eager encode is calm-gated, pressure-checked, and `gpuOnly`
+on unverified budgets — sam-engine returns `{skipped:'wasm-lane'}`), so the
+observed freeze is the FIRST CLICK paying the wasm encode arena (or a stale
+deploy). Two residual fixes: (1) the wasm SlimSAM session sets
+`enableCpuMemArena:false` + `enableMemPattern:false` — ORT's BFC arena
+over-reserves in big chunks, and its padding was permanent heap growth on the
+exact lane that is the memory floor (measured resident after first encode:
+~3 GB → 1.83 GB). (2) **worker recycle**: the engine's arena release frees
+ORT's view but the worker's grown wasm Memory stays mapped forever (wasm
+memory never shrinks) — so idle hibernate and pressure ≥ 3 on the wasm lane
+now `recycleWorker()` (sam-client): deliberate termination, doesn't count
+toward crash restarts, next selection rebuilds from cached weights. Measured:
+resident 1771 MB → **20 MB** after release. GPU sessions keep ORT defaults and
+are never recycled. (The 1024-edge encode transient itself is irreducible:
+SlimSAM's processor resizes every input to 1024.)
+
+**Measured (real Chrome 138+, 51 MP JPEG fixture, `scripts/profile-chrome.mjs`):**
+
+| | GPU (WebGPU) | wasm floor (`--disable-gpu` + `?force=wasm`) |
+|---|---|---|
+| import 51 MP | 222 ms · 3 MB | 215 ms · 3 MB (eager encode skipped) |
+| first click | 336 ms | 1.57 s (warm+encode) |
+| second click | 376 ms | 333 ms |
+| YOLOE "cat" cold/warm | 682 / 211 ms | 889 / 367 ms |
+| YOLO-World "cat" | 350 ms fp32 | 540 ms **int8 QDQ loads on ort-web wasm** |
+| peak measured bytes | 367 MB | ~1.9–2.6 GB transient (encode+detect) |
+| resident after release | 206 MB | **20 MB** (`freed=[embedding,arena,worker]`) |
+
+Verify: 114 ok; the 4 failing gates (std8/pro/working-copy export dims,
+pressure-ladder `detector` in freed) fail IDENTICALLY on a clean HEAD
+baseline — pre-existing debt from the YOLOE merge (stale gate expectations
+and/or an export regression), tracked separately, not introduced here.
+Tools: `scripts/quantize-detect-lanes.py` (CALIB_DIR of photos → int8),
+`scripts/profile-chrome.mjs [gpu|wasm]` (real-Chrome memory/latency drive,
+fixture `models/test-fixtures/dslr-45mp.jpg`).
+
 ## 2026-07-17 — RAW develop fixture: first real sensor through LibRaw in the suite (CLOSED)
 
 The fixture-gated develop phase had never decoded a real RAW. Closed with

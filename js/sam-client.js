@@ -60,7 +60,8 @@ const onEngineEvent = (event) => {
 
 let worker = null
 let workerBroken = false
-let workerGeneration = 0 // bumped on every worker death (callers retry on change)
+let workerGeneration = 0 // bumped on every worker death/recycle (callers retry on change)
+let workerCrashes = 0 // real crashes only — deliberate recycles don't count
 const MAX_WORKER_RESTARTS = 2
 let seq = 0
 const pending = new Map() // id → {resolve, reject}
@@ -102,14 +103,15 @@ const getWorker = () => {
             failAllPending(event?.message || 'selection worker crashed')
             try { worker.terminate() } catch { /* already dead */ }
             worker = null
-            if (workerGeneration < MAX_WORKER_RESTARTS) {
-                workerGeneration += 1
+            workerGeneration += 1
+            if (workerCrashes < MAX_WORKER_RESTARTS) {
+                workerCrashes += 1
                 console.warn('[seglab] worker crashed; restarting it fresh:', event?.message)
                 warmPromise = null
                 if (lastWarm) warmUp(lastWarm).catch(() => {})
             } else {
                 console.warn('[seglab] worker crashed repeatedly; switching to inline engine:', event?.message)
-                workerGeneration += 1
+                workerCrashes += 1
                 workerBroken = true
                 clientState.mode = 'inline'
             }
@@ -430,7 +432,7 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => 
             const [{ detectYoloWorld }, { embedSlots }] = await Promise.all([import('./yolo-world-detect.js'), import('./clip-text.js')])
             const emb = await embedSlots(payload.phrases)
             if (!emb) return { dets: [], slotNames: [], backend: null }
-            const r = await withTimeout(detectYoloWorld({ frame: payload.frame, txtFeats: emb.txtFeats, threshold: payload.threshold, scale: payload.scale, dispose: true }), timeoutMs, label)
+            const r = await withTimeout(detectYoloWorld({ frame: payload.frame, txtFeats: emb.txtFeats, threshold: payload.threshold, scale: payload.scale, webgpu: payload.webgpu !== false, dispose: true }), timeoutMs, label)
             return { ...r, slotNames: emb.slotNames }
         }
         const yoloe = await import('./yoloe-detect.js')
@@ -456,11 +458,11 @@ const callDetectWorker = async (payload, transfer, timeoutMs, label, idleMs) => 
  *  transfers). Runs in the disposable detect worker; `evict` drops the SAM
  *  embedding first so they never peak together; `idleMs` (0 = now) sets when the
  *  worker is terminated to reclaim its wasm arena. */
-export const detectTextYoloe = async (frame, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false } = {}) => {
+export const detectTextYoloe = async (frame, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false, webgpu = true } = {}) => {
     if (evict) await releaseDocument()
     const result = await enqueueHeavy(
         'detect',
-        () => callDetectWorker({ lane: 'yoloe', frame, scale, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'YOLOE detection', idleMs),
+        () => callDetectWorker({ lane: 'yoloe', frame, scale, threshold, webgpu }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'YOLOE detection', idleMs),
         { priority: 'normal', revision },
     )
     if (result === STALE) return { dets: [], backend: null, stale: true }
@@ -471,11 +473,11 @@ export const detectTextYoloe = async (frame, { scale = 's', threshold = 0.25, re
  *  (the phrase + taxonomy synonyms) are CLIP-encoded in the worker to condition
  *  the vision head; returns { dets:[{box,score,classIdx}], slotNames, backend }
  *  where slotNames[classIdx] is the phrase a detection matched. */
-export const detectTextYoloWorld = async (frame, phrases, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false } = {}) => {
+export const detectTextYoloWorld = async (frame, phrases, { scale = 's', threshold = 0.25, revision = null, idleMs = 0, evict = false, webgpu = true } = {}) => {
     if (evict) await releaseDocument()
     const result = await enqueueHeavy(
         'detect',
-        () => callDetectWorker({ lane: 'yoloworld', frame, phrases, scale, threshold }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs),
+        () => callDetectWorker({ lane: 'yoloworld', frame, phrases, scale, threshold, webgpu }, [frame.data.buffer], DETECT_TIMEOUT_MS, 'Open-vocab detection', idleMs),
         { priority: 'normal', revision },
     )
     if (result === STALE) return { dets: [], slotNames: [], backend: null, stale: true }
@@ -492,4 +494,23 @@ export const engineState = () => call('state', {}, null, 30_000, 'engine state')
 export const relievePressure = async (level = 1) => {
     const res = await call('pressure', { level }, null, INFER_TIMEOUT_MS, 'relieve pressure')
     return res?.freed || []
+}
+
+/** Deliberate worker recycle (hibernate / pressure ≥ 3 on the wasm lane) —
+ *  NOT a crash. The engine's arena release frees ORT's view, but the worker's
+ *  grown wasm Memory stays mapped forever (wasm memory never shrinks) —
+ *  termination is the only true free, same doctrine as the detect worker.
+ *  Doesn't count toward MAX_WORKER_RESTARTS; the next op lazily rebuilds from
+ *  cached weights. No-op in inline mode (can't terminate the page). */
+export const recycleWorker = (reason = 'recycle') => {
+    if (!worker || workerBroken) return false
+    trace('worker-recycled', { reason })
+    failAllPending(`selection worker recycled (${reason})`)
+    try { worker.terminate() } catch { /* already gone */ }
+    worker = null
+    workerGeneration += 1
+    warmPromise = null
+    clientState.ready = false
+    emit({ type: 'state' })
+    return true
 }

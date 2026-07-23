@@ -58,13 +58,16 @@ const loadVocab = async (scale) => {
 let session = null
 let sessionPromise = null
 let loadedScale = null
+let loadedEps = null // the EP preference the session was built under
 let backend = null // 'webgpu' | 'wasm' — the EP that actually built
 
-/** Build the session for `scale`, trying WebGPU then WASM (ORT falls back
- *  silently inside a multi-EP list, so probe one at a time to record the EP). */
-const buildSession = async (ort, scale) => {
+/** Build the session for `scale`, trying the allowed EPs in order (ORT falls
+ *  back silently inside a multi-EP list, so probe one at a time to record the
+ *  EP). GPU-first on every vendor; wasm is the floor, and the only lane when
+ *  the pressure ratchet has cleared detectorWebGPU. */
+const buildSession = async (ort, scale, eps) => {
     let lastErr
-    for (const ep of ['webgpu', 'wasm']) {
+    for (const ep of eps) {
         try {
             const s = await ort.InferenceSession.create(modelURL(scale), {
                 executionProviders: [ep],
@@ -77,19 +80,22 @@ const buildSession = async (ort, scale) => {
     throw lastErr || new Error('yoloe: no execution provider available')
 }
 
-export const loadYoloe = (scale = 's') => {
+export const loadYoloe = (scale = 's', { webgpu = true } = {}) => {
     if (!SCALES.has(scale)) scale = 's'
-    if (session && loadedScale === scale) return Promise.resolve(session)
-    if (sessionPromise && loadedScale === scale) return sessionPromise
-    if (session) disposeYoloe() // scale switch — release the old session first
+    const eps = webgpu ? ['webgpu', 'wasm'] : ['wasm']
+    const epsKey = eps.join()
+    if (session && loadedScale === scale && loadedEps === epsKey) return Promise.resolve(session)
+    if (sessionPromise && loadedScale === scale && loadedEps === epsKey) return sessionPromise
+    if (session) disposeYoloe() // scale/EP switch — release the old session first
     loadedScale = scale
+    loadedEps = epsKey
     sessionPromise = (async () => {
         const ort = await loadOrt()
         await loadVocab(scale)
-        session = await buildSession(ort, scale)
+        session = await buildSession(ort, scale, eps)
         return session
     })()
-    sessionPromise.catch(() => { if (loadedScale === scale) { sessionPromise = null; loadedScale = null } })
+    sessionPromise.catch(() => { if (loadedScale === scale) { sessionPromise = null; loadedScale = null; loadedEps = null } })
     return sessionPromise
 }
 
@@ -107,6 +113,7 @@ export const disposeYoloe = () => {
     session = null
     sessionPromise = null
     loadedScale = null
+    loadedEps = null
     backend = null
     try { s?.release?.() } catch { /* already gone */ }
 }
@@ -120,10 +127,10 @@ export const yoloeBackend = () => backend
  * { dets: [{ box:[x0,y0,x1,y1] normalized [0,1] to the square, score, label }],
  *   backend }. `scale` picks the model; `dispose`/`idleMs` free the session after.
  */
-export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', dispose = false, idleMs = 0 }) => {
+export const detectYoloe = async ({ frame, threshold = 0.25, scale = 's', webgpu = true, dispose = false, idleMs = 0 }) => {
     cancelIdle()
     const ort = await loadOrt()
-    const s = await loadYoloe(scale)
+    const s = await loadYoloe(scale, { webgpu })
     const vocab = await loadVocab(scale)
     const side = YOLOE_INPUT
     try {

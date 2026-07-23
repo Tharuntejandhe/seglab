@@ -29,7 +29,7 @@ const runYoloWorld = async (payload) => {
     const emb = await embedSlots(payload.phrases, progress)
     if (!emb) return { dets: [], slotNames: [], backend: null }
     const { dets, backend } = await detectYoloWorld({
-        frame: payload.frame, txtFeats: emb.txtFeats, threshold: payload.threshold, scale: payload.scale, dispose: false,
+        frame: payload.frame, txtFeats: emb.txtFeats, threshold: payload.threshold, scale: payload.scale, webgpu: payload.webgpu !== false, dispose: false,
     })
     return { dets, slotNames: emb.slotNames, backend }
 }

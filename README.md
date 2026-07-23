@@ -1,8 +1,9 @@
 # SEGLAB — on-device segmentation
 
 Import a photo, then select anything — clicks (+/−), a box, or a rough lasso
-that snaps to the object. Everything runs in the browser (SlimSAM plus a
-resource-gated Grounding DINO / OWLv2 detector via transformers.js, WebGPU with
+that snaps to the object. Everything runs in the browser (SlimSAM via
+transformers.js, plus YOLOE-26 / YOLO-World open-vocab text lanes with CLIP
+text embeddings on raw onnxruntime-web — GPU-first on every vendor via WebGPU,
 WASM fallback) — no server, no upload, zero cloud.
 
 **Privacy:** images, prompts, masks and all inference stay on this device.
@@ -241,12 +242,16 @@ is capped there and the crisp on-screen preview is a separate display frame.
 - **Rect / Ellipse / Polygon** — direct marquee masks; polygon closes with double-click or `Enter`
 - **Magic / Color** — select a contiguous colour region or all matching colours. Tolerance is the allowed RGB colour distance: start at **36**; lower it (16–28) for a crisp edge, raise it (45–60) only to include shadows/highlights. It never affects Text mode.
 - **Brush** — paint a mask; right-click or Alt paints an erase stroke
-- **Text** — describe an object; the first search downloads a ~151 MB accelerated detector or ~163 MB portable fallback.
-  Grounding DINO/OWLv2 return candidates, so results are not a
-  guarantee that every instance in a crowded scene is found. Colour-qualified
-  prompts also rank boxes using local colour evidence. If it cannot load within
-  the safe memory profile, text
-  selection reports itself unavailable instead of retrying heavier backends
+- **Text** — describe an object. YOLOE-26 (prompt-free, ~4585 baked classes,
+  46 MB at scale s) answers first; any phrase outside its vocabulary falls to
+  YOLO-World (open-vocab, conditioned on precomputed CLIP text embeddings —
+  ~20 MB int8 on the WASM floor, fp32 on WebGPU). Detectors return candidates,
+  so results are not a guarantee that every instance in a crowded scene is
+  found. Colour-qualified prompts also rank boxes using local colour evidence.
+  The footer `Text:` selector forces Small/Medium/Large or turns the YOLOE lane
+  off. Model files are produced by `scripts/export-yoloe.py`,
+  `scripts/export-yolo-world.py` and `scripts/build-clip-vocab.py` into
+  `models/yoloe/`, `models/yolo-world/`, `models/clip-vocab/` (gitignored)
 - `Z` undo · `R` reset · **Cutout PNG** downloads the selection with transparency
 
 ## Verify (headless)
@@ -280,7 +285,8 @@ bun verify.mjs   # policy/sizing/queue/embedding/wasm/static suites + real app i
 - `js/cv-refine-worker.js` / `cv-refine-client.js` + `cpp/cv_refine.cpp` — wasm mask cleanup
 - `js/image-raw.js` — RAW embedded-preview extractor (fast path, no demosaic)
 - `js/raw-develop-worker.js` / `raw-develop-client.js` + `cpp/raw_develop.cpp` — LibRaw wasm develop (preview-less fallback, disposed after use)
-- `js/detect-engine.js` / `detect-worker.js` — disposable, resource-gated text detector
+- `js/yoloe-detect.js` / `yolo-world-detect.js` / `clip-text.js` / `detect-worker.js` — disposable GPU-first text-detect lanes (YOLOE baked vocab → YOLO-World open-vocab, CLIP lookup table)
+- `js/search-taxonomy.js` / `model-registry.js` — main-class→kind recall/facets/autocomplete; localStorage model hints
 - `js/policy.js` / `capability.js` — lite floor, GPU/core-gated standard8 auto-tier, trusted-host tiers, pressure ladder
 - `js/memory-governor.js` — runtime safety net: measured bytes + timer drift → shed (down) / climb signal (up)
 - `scripts/dev-server.mjs` — cross-origin-isolating static dev server (COOP/COEP)

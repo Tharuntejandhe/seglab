@@ -54,6 +54,23 @@ const buildFrame = async (plan) => {
     return { data, width: side, height: side, contentWidth: dw, contentHeight: dh }
 }
 
+// One detector frame per document (~1.2 MB): repeat searches skip the bounded
+// re-decode + readback entirely. Keyed by the asset-store transform's identity
+// (a new import builds a new transform object).
+let frameCache = null // { tf, side, frame }
+
+const frameFor = async (plan, tf) => {
+    if (frameCache && frameCache.tf === tf && frameCache.side === plan.side) return frameCache.frame
+    const frame = await buildFrame(plan)
+    if (frame) frameCache = { tf, side: plan.side, frame }
+    return frame
+}
+
+/** The worker transfers (detaches) the pixel buffer it is handed — send a
+ *  disposable copy so the cached frame stays readable for colour evidence,
+ *  facet tagging, and the next search. */
+const frameForWorker = (frame) => ({ ...frame, data: frame.data.slice() })
+
 /** Prefer candidates that visibly contain a colour named in the prompt. A
  * broad false-positive box may include a few red pixels; it should not beat a
  * tight red-flower box. If the image has no strong colour evidence, leave the
@@ -78,14 +95,14 @@ const focusRequestedColor = (dets, frame, color) => {
 /** YOLOE baked-vocab candidates: detect everything at 640, keep boxes whose
  *  label matches the phrase's object, then the shared rank/color/collapse
  *  pipeline. Returns null when nothing matches → caller falls back to YOLO-World. */
-export const detectCandidatesYoloe = async (phrase, { scale = 's', rankThreshold = 0.25, idleMs = 0, evict = false } = {}) => {
+export const detectCandidatesYoloe = async (phrase, { scale = 's', rankThreshold = 0.25, idleMs = 0, evict = false, webgpu = true } = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
     const plan = letterboxPlan(tf.originalW, tf.originalH, YOLOE_INPUT)
-    const frame = await buildFrame(plan)
+    const frame = await frameFor(plan, tf)
     if (!frame) return null
-    const { dets, backend } = await detectTextYoloe(frame, { scale, threshold: 0.2, idleMs, evict })
+    const { dets, backend } = await detectTextYoloe(frameForWorker(frame), { scale, threshold: 0.2, idleMs, evict, webgpu })
     // Taxonomy-aware: a main-class phrase ("flower") matches its vocab-child
     // kinds ("rose", "tulip"), which YOLOE labels as separate classes.
     const matched = (dets || []).filter((d) => labelMatchesQuery(norm.objectCore, d.label))
@@ -111,12 +128,12 @@ export const detectCandidatesYoloe = async (phrase, { scale = 's', rankThreshold
  *  into the 32 class slots, run the text-conditioned vision head, then the shared
  *  rank/colour/collapse pipeline. Handles ARBITRARY phrases (unlike the baked
  *  YOLOE lane), on WASM or WebGPU. Returns null when nothing matches. */
-export const detectCandidatesYoloWorld = async (phrase, { scale = 's', rankThreshold = 0.1, idleMs = 0, evict = false } = {}) => {
+export const detectCandidatesYoloWorld = async (phrase, { scale = 's', rankThreshold = 0.1, idleMs = 0, evict = false, webgpu = true } = {}) => {
     const norm = normalizePhrase(phrase)
     const tf = getTransform()
     if (!norm || !tf) return null
     const plan = letterboxPlan(tf.originalW, tf.originalH, YOLOE_INPUT)
-    const frame = await buildFrame(plan)
+    const frame = await frameFor(plan, tf)
     if (!frame) return null
     // Fill the class slots with the full phrase (CLIP reads "red flower"
     // directly) plus any taxonomy synonyms for the object.
@@ -124,7 +141,7 @@ export const detectCandidatesYoloWorld = async (phrase, { scale = 's', rankThres
     const phrases = [...new Set([norm.core, ...(expanded ? expanded.labels : [norm.objectCore])])]
     // YOLO-World-v2 scores run lower than YOLOE's baked head; 0.08 is its
     // usable floor (ref impl uses ~0.05), the shared ranker tightens from there.
-    const { dets, slotNames, backend } = await detectTextYoloWorld(frame, phrases, { scale, threshold: 0.08, idleMs, evict })
+    const { dets, slotNames, backend } = await detectTextYoloWorld(frameForWorker(frame), phrases, { scale, threshold: 0.08, idleMs, evict, webgpu })
     if (!dets || dets.length === 0) return null
     const mapped = []
     for (const d of dets) {

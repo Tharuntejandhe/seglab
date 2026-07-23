@@ -48,6 +48,12 @@ const LANES = {
 const LOAD_TIMEOUT_MS = 12 * 60 * 1000
 const INFER_TIMEOUT_MS = 120 * 1000
 const PROGRESS_THROTTLE_MS = 120
+
+// wasm lane only: ORT's BFC arena over-reserves in big chunks and wasm memory
+// never shrinks, so arena padding becomes permanent heap growth on the exact
+// lane that is already the memory floor. Direct allocation tracks the true
+// working set at a small speed cost. GPU sessions keep ORT defaults.
+const WASM_SESSION_OPTIONS = { session_options: { enableCpuMemArena: false, enableMemPattern: false } }
 // A single WebGPU runtime failure can be a transient driver/compile glitch, so
 // it no longer permanently demotes the session — only this many consecutive
 // failures do. A successful GPU segment resets the counter.
@@ -237,7 +243,7 @@ const loadBundle = () => {
         const loadModel = async () => {
             if (device !== 'webgpu') {
                 state.device = 'wasm'
-                return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...lane.options })
+                return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...WASM_SESSION_OPTIONS, ...lane.options })
             }
             try {
                 const m = await Cls.from_pretrained(lane.model, { device: 'webgpu', progress_callback, ...lane.options })
@@ -255,7 +261,7 @@ const loadBundle = () => {
                     // Only now abandon the GPU — and record it honestly.
                     console.warn('[seglab] SlimSAM WebGPU load failed; WASM fallback:', gpuErr?.message)
                     state.device = 'wasm'
-                    return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...lane.options })
+                    return Cls.from_pretrained(lane.model, { device: 'wasm', progress_callback, ...WASM_SESSION_OPTIONS, ...lane.options })
                 }
             }
         }

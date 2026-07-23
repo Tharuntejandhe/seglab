@@ -13,7 +13,7 @@
 
 import { countMaskComponents, lassoToPrompts, summarizeMaskRGBA, maskToChannel, composeChannels, pointInMask, dilateChannel } from './sam-core.js'
 import {
-    cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure,
+    cancelBefore, clientState, encodeImage, engineState, releaseDocument, segment, subscribe, warmUp, relievePressure, recycleWorker,
 } from './sam-client.js'
 import { applyMemoryPressure, resolveBudget } from './policy.js'
 import { createMemoryGovernor } from './memory-governor.js'
@@ -707,7 +707,16 @@ const shedMemory = (level, { announce = true } = {}) => {
         }
         refreshChips()
     }
-    return relievePressure(level).catch(() => [])
+    return relievePressure(level).catch(() => []).then((freed) => {
+        // The engine op frees ORT's allocations, but the worker's grown wasm
+        // Memory stays mapped (wasm memory never shrinks) — at L3 on the wasm
+        // lane the worker itself is recycled; termination returns it to the OS.
+        if ((BUDGET.pressureLevel || 0) >= 3 && clientState.device === 'wasm' && recycleWorker('pressure')) {
+            state.encodePending = true
+            freed.push('worker')
+        }
+        return freed
+    })
 }
 
 // Backgrounded tab → drop the detector (cheap to reload) and stop optional
@@ -758,7 +767,9 @@ const hibernateEngine = () => {
     samIdleTimer = null
     if (!state.hasImage) return
     if (state.running) { samIdleTimer = setTimeout(hibernateEngine, 5000); return } // busy — retry
-    relievePressure(3).catch(() => {})
+    relievePressure(3)
+        .then(() => { if (clientState.device === 'wasm') recycleWorker('hibernate') })
+        .catch(() => {})
     state.encodePending = true // next selection rebuilds + re-encodes; status reflects it
     if (DEBUG) console.log('[seglab] idle hibernate — session arena released; next selection rebuilds')
 }
@@ -1679,6 +1690,9 @@ async function runDetect(phrase) {
     const ywScale = ['s', 'm', 'l', 'x'].includes(yoloeScale) ? yoloeScale : 's'
     const idleMs = BUDGET.detectorDispose === 'now' ? 0 : (BUDGET.detectorIdleMs || 0)
     const evict = BUDGET.detectorEvictOnEncode === true
+    // GPU-first on every vendor; the pressure ratchet (detectorWebGPU=false)
+    // pins the lanes to their wasm floor until the tab is calm again.
+    const webgpu = BUDGET.detectorWebGPU !== false
     setStatus(`Looking for “${phrase.trim()}”… (first search downloads the detector, then it's cached)`)
     if (revision !== state.revision) return // superseded while checking
     try {
@@ -1686,11 +1700,11 @@ async function runDetect(phrase) {
         // the open-vocab YOLO-World lane (CLIP-conditioned, arbitrary phrases).
         let res = null
         if (yoloeEnabled) {
-            res = await detectCandidatesYoloe(phrase, { scale: yoloeScale, idleMs, evict })
+            res = await detectCandidatesYoloe(phrase, { scale: yoloeScale, idleMs, evict, webgpu })
             if (revision !== state.revision) return
         }
         if (!res) {
-            res = await detectCandidatesYoloWorld(phrase, { scale: ywScale, idleMs, evict })
+            res = await detectCandidatesYoloWorld(phrase, { scale: ywScale, idleMs, evict, webgpu })
             if (revision !== state.revision) return // superseded by newer input
         }
         state.textBackend = res?.backend || null
