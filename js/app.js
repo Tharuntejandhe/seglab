@@ -23,7 +23,7 @@ import { saveSession, loadSession, clearSession } from './session-store.js'
 import { isRawFile, extractRawPreview } from './image-raw.js'
 import { developRaw } from './raw-develop-client.js'
 import { buildCutout, exportCutoutBlob, escalateCrop, getHdPatch, clearHdPatch } from './export-hd.js'
-import { detectCandidatesYoloe, detectCandidatesYoloWorld } from './text-ui.js'
+import { detectCandidatesColorRegion, detectCandidatesYoloe, detectCandidatesYoloWorld } from './text-ui.js'
 import { suggest, buildFacets } from './search-taxonomy.js'
 import { modelRegistry, noteModel, isModelNoted, laneOfModel } from './model-registry.js'
 import { clearHeavyQueue, getHeavyQueueState, getHeavyQueueLog } from './heavy-job-queue.js'
@@ -1766,6 +1766,13 @@ async function runDetect(phrase) {
         if (!res) {
             res = await detectCandidatesYoloWorld(phrase, { scale: ywScale, idleMs, evict, webgpu })
             if (revision !== state.revision) return // superseded by newer input
+        }
+        if (!res) {
+            // Both OBJECT lanes empty: a colour-qualified "stuff" phrase (green
+            // leaves / blue sky) is served from pixel evidence — colour-region
+            // proposals over the same cached frame, no model.
+            res = await detectCandidatesColorRegion(phrase)
+            if (revision !== state.revision) return
         }
         state.textBackend = res?.backend || null
         refreshChips()

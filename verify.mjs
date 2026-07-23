@@ -24,7 +24,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  bareLabel, classifyPixelColor, collapseToObject, colorEvidenceForBox, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, unletterboxBox,
+  bareLabel, classifyPixelColor, collapseToObject, colorEvidenceForBox, colorRegionsFromFrame, degenerateScores, DETECTOR_INPUT, dominantColorForBox, letterboxPlan, normalizePhrase, nms, pruneContainers, rankDetections, scaleBox, unletterboxBox,
 } from './js/text-core.js'
 import {
   buildFacets, expandQuery, labelMatchesQuery, regionOf, suggest,
@@ -324,6 +324,37 @@ try {
       && classifyPixelColor(8, 8, 8) === 'black' && dom?.color === 'red',
     `dom=${dom?.color}`,
   )
+
+  // Colour-region proposals — the "stuff" fallback when both object-detector
+  // lanes are empty on a colour-qualified phrase (object heads cannot box
+  // amorphous material: measured zero anchors for 'leaf' on a leaf-filled
+  // garden). Pure pixel evidence: threshold + connected components.
+  {
+    const side = 640
+    const px = new Uint8ClampedArray(side * side * 3).fill(128)
+    const put = (x0, y0, x1, y1, r, g, b) => {
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const i = (y * side + x) * 3
+          px[i] = r; px[i + 1] = g; px[i + 2] = b
+        }
+      }
+    }
+    put(100, 150, 300, 350, 40, 180, 60)   // the leaf mass
+    put(500, 500, 506, 506, 40, 180, 60)   // sub-min-area crumb — must drop
+    put(400, 100, 500, 200, 210, 40, 40)   // red patch — must not match green
+    const cframe = { data: px, width: side, height: side, contentWidth: side, contentHeight: side }
+    const greens = colorRegionsFromFrame(cframe, 'green')
+    const box = greens[0]?.box.map((v) => Math.round(v * side)) || []
+    check(
+      'colour regions: green mass boxed exactly, crumb dropped, other colours separate',
+      greens.length === 1 && box[0] === 100 && box[1] === 150 && box[2] === 300 && box[3] === 350
+        && greens[0].score > 0.3
+        && colorRegionsFromFrame(cframe, 'blue').length === 0
+        && colorRegionsFromFrame(cframe, 'red').length === 1,
+      JSON.stringify({ n: greens.length, box }),
+    )
+  }
 
   // Edge refiner: boundary-local soft alpha (unchanged contract).
   const ew = 37

@@ -5,7 +5,7 @@
  * state or DOM here; app.js owns the input, overlay, and selection glue.
  */
 import {
-    collapseToObject, colorEvidenceForBox, dominantColorForBox, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox, YOLOE_INPUT,
+    collapseToObject, colorEvidenceForBox, colorRegionsFromFrame, dominantColorForBox, DETECTOR_PAD, letterboxPlan, normalizePhrase, rankDetections, scaleBox, unletterboxBox, YOLOE_INPUT,
 } from './text-core.js'
 import { labelMatchesQuery, expandQuery } from './search-taxonomy.js'
 import { getTransform, getBoundedOriginal } from './asset-store.js'
@@ -158,4 +158,34 @@ export const detectCandidatesYoloWorld = async (phrase, { scale = 's', rankThres
     }).map((d) => toCandidate(d, frame, kx, ky))
     const candidates = norm.multi ? ranked : collapseToObject(ranked)
     return { candidates, multi: norm.multi, backend: `yoloworld:${backend}`, display: norm.display }
+}
+
+/** Colour-region candidates: the "stuff" fallback when BOTH object-detector
+ *  lanes come up empty on a colour-qualified phrase ("green leaves", "blue
+ *  sky"). Object heads cannot box amorphous material (measured: zero anchors
+ *  for 'leaf' on a leaf-filled garden), but the pixels are the evidence — the
+ *  requested colour's own regions become the candidates, from the SAME cached
+ *  frame, through the same rank/collapse pipeline, model-free. Returns null
+ *  without a colour word or when the colour simply isn't in the image. */
+export const detectCandidatesColorRegion = async (phrase) => {
+    const norm = normalizePhrase(phrase)
+    const tf = getTransform()
+    if (!norm || !norm.color || !tf) return null
+    const plan = letterboxPlan(tf.originalW, tf.originalH, YOLOE_INPUT)
+    const frame = await frameFor(plan, tf)
+    if (!frame) return null
+    const regions = colorRegionsFromFrame(frame, norm.color)
+    if (regions.length === 0) return null
+    const mapped = []
+    for (const d of regions) {
+        const box = unletterboxBox(d.box, plan)
+        if (box) mapped.push({ box, rawBox: d.box, score: d.score, label: norm.objectCore || norm.color })
+    }
+    if (mapped.length === 0) return null
+    const kx = tf.proxyW / tf.originalW
+    const ky = tf.proxyH / tf.originalH
+    const ranked = rankDetections(mapped, { threshold: 0, iou: 0.5, topK: 8, relative: 0.2 })
+        .map((d) => ({ ...toCandidate(d, frame, kx, ky), color: norm.color }))
+    const candidates = norm.multi ? ranked : collapseToObject(ranked)
+    return { candidates, multi: norm.multi, backend: 'colorregion', display: norm.display }
 }

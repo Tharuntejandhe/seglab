@@ -252,6 +252,78 @@ export const colorEvidenceForBox = (frame, box, color, { maxSamples = 4096 } = {
     return sampled ? matches / sampled : 0
 }
 
+/**
+ * Colour-region proposals from raw pixel evidence — the "stuff" fallback.
+ * Both detector lanes are OBJECT detectors (grounding-data heads): they cannot
+ * box amorphous material ("green leaves", "blue sky", "brown soil") no matter
+ * how good the text embedding is — measured: YOLO-World with a perfect 'leaf'
+ * embedding proposes zero anchors on a leaf-filled garden. When a query names
+ * a colour, the pixels themselves are the evidence: threshold the frame with
+ * the requested colour's rule, connected-components on a strided grid, and the
+ * big components become candidate boxes for the normal ranking pipeline.
+ * Pure and model-free; boxes come back normalized [0,1] to the square, same
+ * contract as the detector lanes. `minFrac` is the component floor as a
+ * fraction of the CONTENT area (not the padded square).
+ */
+export const colorRegionsFromFrame = (frame, color, { stride = 2, minFrac = 0.004, topK = 8 } = {}) => {
+    if (!frame?.data || !color) return []
+    const { data, width, height } = frame
+    const usableW = Math.min(width, frame.contentWidth || width)
+    const usableH = Math.min(height, frame.contentHeight || height)
+    const gw = Math.ceil(usableW / stride)
+    const gh = Math.ceil(usableH / stride)
+    if (gw < 4 || gh < 4) return []
+    const grid = new Uint8Array(gw * gh)
+    for (let gy = 0; gy < gh; gy += 1) {
+        const y = gy * stride
+        for (let gx = 0; gx < gw; gx += 1) {
+            const i = (y * width + gx * stride) * 3
+            if (isRequestedColor(data[i], data[i + 1], data[i + 2], color)) grid[gy * gw + gx] = 1
+        }
+    }
+    // 4-connected components, iterative stack (no recursion on a 320² grid).
+    const label = new Int32Array(gw * gh)
+    const stack = []
+    const regions = []
+    const minCells = Math.max(8, Math.floor(gw * gh * minFrac))
+    let nextLabel = 0
+    for (let start = 0; start < grid.length; start += 1) {
+        if (!grid[start] || label[start]) continue
+        nextLabel += 1
+        label[start] = nextLabel
+        stack.length = 0
+        stack.push(start)
+        let cells = 0
+        let x0 = gw; let x1 = 0; let y0 = gh; let y1 = 0
+        while (stack.length) {
+            const p = stack.pop()
+            cells += 1
+            const px = p % gw
+            const py = (p / gw) | 0
+            if (px < x0) x0 = px
+            if (px > x1) x1 = px
+            if (py < y0) y0 = py
+            if (py > y1) y1 = py
+            if (px > 0 && grid[p - 1] && !label[p - 1]) { label[p - 1] = nextLabel; stack.push(p - 1) }
+            if (px < gw - 1 && grid[p + 1] && !label[p + 1]) { label[p + 1] = nextLabel; stack.push(p + 1) }
+            if (py > 0 && grid[p - gw] && !label[p - gw]) { label[p - gw] = nextLabel; stack.push(p - gw) }
+            if (py < gh - 1 && grid[p + gw] && !label[p + gw]) { label[p + gw] = nextLabel; stack.push(p + gw) }
+        }
+        if (cells < minCells) continue
+        const bw = (x1 - x0 + 1)
+        const bh = (y1 - y0 + 1)
+        regions.push({
+            // Grid box → pixel box → normalized to the SQUARE (detector contract).
+            box: [(x0 * stride) / width, (y0 * stride) / height, ((x1 + 1) * stride) / width, ((y1 + 1) * stride) / height],
+            frac: cells / (gw * gh),
+            // Confidence = how solidly the box is filled with the colour (density)
+            // damped toward the mid-range: these are proposals, not detections.
+            score: Math.min(0.9, 0.3 + 0.6 * (cells / (bw * bh))),
+        })
+    }
+    return regions.sort((a, b) => b.frac - a.frac).slice(0, topK)
+}
+
 /** Dominant colour bucket inside a normalized box → { color, frac } or null.
  *  Tallies each sampled pixel into a single bucket (classifyPixelColor) and
  *  returns the winner when it covers at least `minFrac`. Drives the colour
