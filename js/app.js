@@ -2199,9 +2199,14 @@ els.cutout.addEventListener('click', async () => {
     // in the app, and the user is waiting on a file, not the canvas.
     const epoch = showPrep(wasNative ? 'Rebuilding the cutout at full resolution…' : 'Building the cutout…')
     try {
-        // Detector and wasm-refine workers are unrelated to a cutout export
-        // and hold memory. Release both before the bounded export canvases.
-        await relievePressure(1)
+        // Detector and wasm-refine workers are unrelated to a cutout export and
+        // hold memory. On a memory-tight context (the WASM floor, or already
+        // under pressure) free both before the export canvases. On a healthy GPU
+        // device with no pressure, keep the detector warm — its footprint is
+        // small there and export is cheap, so a search→export→search stays
+        // instant instead of paying a session rebuild. cv-refine goes either way.
+        const tight = clientState.device === 'wasm' || (BUDGET.pressureLevel || 0) > 0
+        if (tight) await relievePressure(1)
         disposeCvRefine()
         let out = null
         if (wasNative) {
